@@ -85,3 +85,9 @@ Or after building:
 ```bash
 ./zig-out/bin/sarek path/to/document.pdf
 ```
+
+## Documentation
+- Glib: https://docs.gtk.org/glib/
+- Poppler: https://poppler.freedesktop.org/api/glib/
+- Gtk3: https://docs.gtk.org/gtk3/
+- Cairo: https://www.cairographics.org/documentation/
