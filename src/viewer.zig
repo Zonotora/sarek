@@ -9,6 +9,13 @@ const c = @cImport({
     @cInclude("cairo.h");
 });
 
+const PAGE_OFFSET: f64 = 20.0;
+
+const ScrollDirection = enum {
+    UP,
+    DOWN,
+};
+
 pub const Viewer = struct {
     const Self = @This();
 
@@ -22,9 +29,19 @@ pub const Viewer = struct {
     total_pages: u32,
     scale: f64,
 
+    // Multi-page rendering state
+    scroll_y: f64,
+    page_spacing: f64,
+    pages_per_view: u32,
+
+    // Page layout cache
+    page_heights: std.ArrayList(f64),
+    page_positions: std.ArrayList(f64), // Y positions for each page
+
     // GTK widgets
     window: ?*c.GtkWidget,
     drawing_area: ?*c.GtkWidget,
+    scrolled_window: ?*c.GtkWidget,
 
     pub fn init(allocator: std.mem.Allocator, pdf_path: []const u8) !Self {
         const backend_impl = try allocator.create(poppler.PopplerBackend);
@@ -40,6 +57,24 @@ pub const Viewer = struct {
             return error.InvalidPdf;
         }
 
+        var page_heights = std.ArrayList(f64).init(allocator);
+        var page_positions = std.ArrayList(f64).init(allocator);
+
+        // Pre-calculate page heights and positions for layout
+        var current_y: f64 = 0;
+        for (0..total_pages) |i| {
+            const page_info = backend_interface.getPageInfo(@intCast(i)) catch {
+                page_heights.deinit();
+                page_positions.deinit();
+                allocator.destroy(backend_impl);
+                return error.InvalidPdf;
+            };
+            try page_heights.append(page_info.height);
+            try page_positions.append(current_y);
+
+            current_y += page_info.height + PAGE_OFFSET; // page_spacing = 20.0
+        }
+
         return Self{
             .allocator = allocator,
             .backend_impl = backend_impl,
@@ -48,14 +83,22 @@ pub const Viewer = struct {
             .current_page = 0,
             .total_pages = total_pages,
             .scale = 1.0,
+            .scroll_y = 0.0,
+            .page_spacing = PAGE_OFFSET,
+            .pages_per_view = @min(total_pages, 3), // Show up to 3 pages at once
+            .page_heights = page_heights,
+            .page_positions = page_positions,
             .window = null,
             .drawing_area = null,
+            .scrolled_window = null,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.backend.deinit();
         self.keybindings.deinit();
+        self.page_heights.deinit();
+        self.page_positions.deinit();
         self.allocator.destroy(self.backend_impl);
     }
 
@@ -70,15 +113,38 @@ pub const Viewer = struct {
         c.gtk_window_set_title(@ptrCast(self.window), "Sarek PDF Viewer");
         c.gtk_window_set_default_size(@ptrCast(self.window), 800, 600);
 
+        // Create scrolled window for multi-page view
+        self.scrolled_window = c.gtk_scrolled_window_new(null, null);
+        if (self.scrolled_window == null) return error.GtkInitFailed;
+
+        // Configure scrolled window
+        c.gtk_scrolled_window_set_policy(@ptrCast(self.scrolled_window), c.GTK_POLICY_AUTOMATIC, c.GTK_POLICY_AUTOMATIC);
+
         // Create drawing area
         self.drawing_area = c.gtk_drawing_area_new();
         if (self.drawing_area == null) return error.GtkInitFailed;
 
-        c.gtk_container_add(@ptrCast(self.window), self.drawing_area);
+        // Initialize page positions with current scale
+        self.recalculatePagePositions();
+
+        // Calculate total height from last page position + its height
+        const total_height = if (self.total_pages > 0)
+            self.page_positions.items[self.total_pages - 1] +
+                (self.page_heights.items[self.total_pages - 1] * self.scale)
+        else
+            0;
+
+        // Set drawing area size
+        c.gtk_widget_set_size_request(self.drawing_area, 800, @intFromFloat(total_height));
+
+        c.gtk_container_add(@ptrCast(self.scrolled_window), self.drawing_area);
+        c.gtk_container_add(@ptrCast(self.window), self.scrolled_window);
 
         // Connect signals
         _ = c.g_signal_connect_data(self.window, "destroy", @ptrCast(&onDestroy), null, null, 0);
         _ = c.g_signal_connect_data(self.drawing_area, "draw", @ptrCast(&onDraw), self, null, 0);
+
+        // _ = c.g_signal_connect_data(self.window, "scroll_event", @ptrCast(&onScroll), self, null, 0);
 
         // Add key event handling
         c.gtk_widget_add_events(self.window, c.GDK_KEY_PRESS_MASK);
@@ -100,39 +166,49 @@ pub const Viewer = struct {
             .next_page => {
                 if (self.current_page + 1 < self.total_pages) {
                     self.current_page += 1;
-                    self.redraw();
+                    self.scrollToPage(self.current_page);
                 }
             },
             .prev_page => {
                 if (self.current_page > 0) {
                     self.current_page -= 1;
-                    self.redraw();
+                    self.scrollToPage(self.current_page);
                 }
             },
             .first_page => {
                 self.current_page = 0;
-                self.redraw();
+                self.scrollToPage(self.current_page);
             },
             .last_page => {
                 self.current_page = self.total_pages - 1;
-                self.redraw();
+                self.scrollToPage(self.current_page);
             },
             .zoom_in => {
                 self.scale = @min(self.scale * 1.2, 5.0);
+                self.updateDrawingAreaSize();
                 self.redraw();
             },
             .zoom_out => {
                 self.scale = @max(self.scale / 1.2, 0.1);
+                self.updateDrawingAreaSize();
                 self.redraw();
             },
             .zoom_original => {
                 self.scale = 1.0;
+                self.updateDrawingAreaSize();
                 self.redraw();
             },
             .quit => {
                 c.gtk_main_quit();
             },
+            .scroll_up => {
+                self.scroll(ScrollDirection.UP);
+            },
+            .scroll_down => {
+                self.scroll(ScrollDirection.DOWN);
+            },
             .refresh => {
+                self.updateDrawingAreaSize();
                 self.redraw();
             },
             else => {
@@ -142,10 +218,106 @@ pub const Viewer = struct {
         }
     }
 
+    fn recalculatePagePositions(self: *Self) void {
+        var current_y: f64 = 0;
+        for (0..self.total_pages) |i| {
+            self.page_positions.items[i] = current_y;
+            current_y += self.page_heights.items[i] * self.scale + self.page_spacing;
+        }
+    }
+
+    fn updateDrawingAreaSize(self: *Self) void {
+        // Recalculate positions with new scale
+        self.recalculatePagePositions();
+
+        // Calculate total height from last page position + its height
+        const total_height = if (self.total_pages > 0)
+            self.page_positions.items[self.total_pages - 1] +
+                (self.page_heights.items[self.total_pages - 1] * self.scale)
+        else
+            0;
+
+        if (self.drawing_area) |area| {
+            c.gtk_widget_set_size_request(area, 800, @intFromFloat(total_height));
+        }
+    }
+
     fn redraw(self: *Self) void {
         if (self.drawing_area) |area| {
             c.gtk_widget_queue_draw(area);
         }
+    }
+
+    fn getPageYPosition(self: *Self, page: u32) f64 {
+        if (page >= self.total_pages) return 0;
+        return self.page_positions.items[page];
+    }
+
+    fn getVisiblePageRange(self: *Self) struct { first: u32, last: u32 } {
+        if (self.scrolled_window == null) return .{ .first = 0, .last = @min(2, self.total_pages - 1) };
+
+        const scrolled = self.scrolled_window.?;
+        const vadjustment = c.gtk_scrolled_window_get_vadjustment(@ptrCast(scrolled));
+        if (vadjustment == null) return .{ .first = 0, .last = @min(2, self.total_pages - 1) };
+
+        const vadj = vadjustment.?;
+        const scroll_top = c.gtk_adjustment_get_value(vadj);
+        const viewport_height = c.gtk_adjustment_get_page_size(vadj);
+        const scroll_bottom = scroll_top + viewport_height;
+
+        var first_visible: ?u32 = null;
+        var last_visible: u32 = 0;
+
+        for (0..self.total_pages) |page_idx| {
+            const page = @as(u32, @intCast(page_idx));
+            const page_height = self.page_heights.items[page_idx] * self.scale;
+            const page_top = self.page_positions.items[page_idx];
+            const page_bottom = page_top + page_height;
+
+            // Check if page is visible (overlaps with viewport with buffer)
+            if (page_bottom >= scroll_top - 100 and page_top <= scroll_bottom + 100) { // 100px buffer
+                if (first_visible == null) {
+                    first_visible = page;
+                }
+                last_visible = page;
+            }
+        }
+
+        return .{ .first = first_visible orelse 0, .last = @min(last_visible, self.total_pages - 1) };
+    }
+
+    fn scrollToPage(self: *Self, page: u32) void {
+        if (page >= self.total_pages) return;
+
+        const y_position = self.getPageYPosition(page);
+
+        if (self.scrolled_window) |scrolled| {
+            const vadjustment = c.gtk_scrolled_window_get_vadjustment(@ptrCast(scrolled));
+            if (vadjustment) |vadj| {
+                c.gtk_adjustment_set_value(vadj, y_position);
+            }
+        }
+    }
+
+    fn scroll(self: *Self, direction: ScrollDirection) void {
+        _ = self;
+        _ = direction;
+        // if (self.scrolled_window) |scrolled| {
+        //     const vadjustment = c.gtk_scrolled_window_get_vadjustment(@ptrCast(scrolled));
+        //     if (vadjustment) |vadj| {
+        //         const current_val = c.gtk_adjustment_get_value(vadj);
+        //         const step = c.gtk_adjustment_get_step_increment(vadj);
+        //         const increment = switch (direction) {
+        //             .UP => current_val - step * 3,
+        //             .DOWN => current_val + step * 3,
+        //         };
+        //         c.gtk_adjustment_set_value(vadj, increment);
+
+        //         // Update current page
+        //         // self.page_heights
+        //         std.debug.print("curr={} step={}\n", .{ current_val, step });
+        //     }
+        // }
     }
 };
 
@@ -294,18 +466,97 @@ fn onKeyPress(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callc
     return 1; // Event handled
 }
 
+const GdkEventScroll = extern struct {
+    type: GdkEventType,
+    window: ?*anyopaque,
+    send_event: i8,
+    time: u32,
+    x: f64,
+    y: f64,
+    state: ?*anyopaque, // if the pointer can be null; else without '?'
+    direction: c.GdkScrollDirection,
+    device: ?*anyopaque,
+    x_root: f64,
+    y_root: f64,
+    delta_x: f64,
+    delta_y: f64,
+    is_stop: bool, // replaces guint is_stop : 1;
+};
+
+fn onScroll(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
+    _ = user_data;
+
+    const gdk_event: *GdkEventScroll = @ptrCast(@alignCast(event.?));
+    std.debug.print("{}\n", .{gdk_event});
+
+    // std.debug.print("scroll", .{});
+    return 1;
+}
+
 fn onDraw(_: *c.GtkWidget, ctx: *c.cairo_t, user_data: ?*anyopaque) callconv(.C) c.gboolean {
     const viewer: *Viewer = @ptrCast(@alignCast(user_data));
 
-    // Clear background to white
-    c.cairo_set_source_rgb(ctx, 1.0, 1.0, 1.0);
+    // Clear background to light gray
+    c.cairo_set_source_rgb(ctx, 0.9, 0.9, 0.9);
     c.cairo_paint(ctx);
 
-    // Render the current page
-    viewer.backend.renderPage(viewer.current_page, ctx, viewer.scale) catch |err| {
-        std.debug.print("Error rendering page: {}\n", .{err});
-        return 0;
-    };
+    // Get visible page range for performance
+    const visible_range = viewer.getVisiblePageRange();
+
+    // Only render visible pages + small buffer
+    for (visible_range.first..visible_range.last + 1) |page_idx| {
+        const page = @as(u32, @intCast(page_idx));
+        const page_height = viewer.page_heights.items[page_idx] * viewer.scale;
+
+        // Calculate this page's Y position
+        const page_y = viewer.getPageYPosition(page);
+
+        // Save the current transform
+        c.cairo_save(ctx);
+
+        // Translate to the page position
+        c.cairo_translate(ctx, 50, page_y + 10); // 50px left margin, 10px top margin
+
+        // Draw white background for the page
+        const page_info = viewer.backend.getPageInfo(page) catch {
+            c.cairo_restore(ctx);
+            continue;
+        };
+
+        const page_width = page_info.width * viewer.scale;
+
+        c.cairo_set_source_rgb(ctx, 1.0, 1.0, 1.0);
+        c.cairo_rectangle(ctx, 0, 0, page_width, page_height);
+        c.cairo_fill(ctx);
+
+        // Draw subtle border
+        c.cairo_set_source_rgb(ctx, 0.7, 0.7, 0.7);
+        c.cairo_set_line_width(ctx, 1.0);
+        c.cairo_rectangle(ctx, 0, 0, page_width, page_height);
+        c.cairo_stroke(ctx);
+
+        // Render the page content
+        viewer.backend.renderPage(page, ctx, viewer.scale) catch |err| {
+            std.debug.print("Error rendering page {}: {}\n", .{ page, err });
+        };
+
+        // Restore the transform
+        c.cairo_restore(ctx);
+
+        // Add page number label
+        c.cairo_save(ctx);
+        c.cairo_set_source_rgb(ctx, 0.3, 0.3, 0.3);
+        c.cairo_select_font_face(ctx, "sans-serif", c.CAIRO_FONT_SLANT_NORMAL, c.CAIRO_FONT_WEIGHT_NORMAL);
+        c.cairo_set_font_size(ctx, 12.0);
+
+        // Create page number string
+        var page_num_buf: [32]u8 = undefined;
+        const page_num_str = std.fmt.bufPrintZ(page_num_buf[0..], "Page {}", .{page + 1}) catch "Page ?";
+
+        c.cairo_move_to(ctx, 10, page_y + page_height + 25);
+        c.cairo_show_text(ctx, page_num_str.ptr);
+        c.cairo_restore(ctx);
+    }
 
     return 0;
 }
