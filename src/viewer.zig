@@ -511,7 +511,7 @@ const GdkEventKey = extern struct {
     window: *anyopaque, // Pointer field => pointer in Zig
     send_event: i8, // gint8 => i8
     time: u32, // guint32 => u32
-    state: *anyopaque, // Pointer to another type
+    state: u32, // GdkModifierType => u32 (modifier state, not a pointer!)
     keyval: u32, // guint => u32, usually used for key codes in GDK
     length: i32, // gint => i32
     string: [*c]u8, // gchar* => C pointer to u8 (or i8 if you want signed chars)
@@ -523,42 +523,23 @@ const GdkEventKey = extern struct {
 fn onKeyPress(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
     const viewer: *Viewer = @ptrCast(@alignCast(user_data));
     const gdk_event: *GdkEventKey = @ptrCast(@alignCast(event.?));
-    // std.debug.print("type={s} keyval={}\n", .{ gdk_event.type.name(), gdk_event.keyval });
-    std.debug.print("{}\n", .{gdk_event});
-    // Hardcoded j=44
-    if (gdk_event.hardware_keycode == 44) {
-        if (viewer.current_page < viewer.total_pages - 1) {
-            viewer.executeCommand(.next_page);
-        }
-    }
-    // Hardcoded k=45
-    if (gdk_event.hardware_keycode == 45) {
-        if (viewer.current_page > 0) {
-            viewer.executeCommand(.prev_page);
-        }
-    }
 
-    // Hardcoded g=42
-    if (gdk_event.hardware_keycode == 42) {
-        viewer.executeCommand(.last_page);
-    }
+    // Extract key information
+    const keyval = gdk_event.keyval;
+    const modifiers = gdk_event.state;
 
-    // Hardcoded a=24
-    if (gdk_event.hardware_keycode == 24) {
-        viewer.executeCommand(.quit);
-    }
+    // Debug output
+    std.debug.print("keyval={} modifiers={} hardware_keycode={}\n", .{ keyval, modifiers, gdk_event.hardware_keycode });
 
-    // Hardcoded a=38
-    if (gdk_event.hardware_keycode == 38) {
-        viewer.executeCommand(.decrease_pages_per_row);
+    // Look up command using the keybinding system
+    if (viewer.keybindings.getCommand(keyval, modifiers)) |command| {
+        std.debug.print("Executing command: {}\n", .{command});
+        viewer.executeCommand(command);
+        return 1; // Event handled
+    } else {
+        std.debug.print("No command found for keyval={} modifiers={}\n", .{ keyval, modifiers });
+        return 0; // Event not handled
     }
-
-    // Hardcoded a=39
-    if (gdk_event.hardware_keycode == 39) {
-        viewer.executeCommand(.increase_pages_per_row);
-    }
-
-    return 1; // Event handled
 }
 
 const GdkEventScroll = extern struct {
