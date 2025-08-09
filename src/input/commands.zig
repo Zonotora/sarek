@@ -21,6 +21,12 @@ pub const Command = enum {
     zoom_fit_width,
     zoom_original,
     
+    // Layout
+    increase_pages_per_row,
+    decrease_pages_per_row,
+    single_page_mode,
+    double_page_mode,
+    
     // Application
     quit,
     refresh,
@@ -48,6 +54,10 @@ pub const Command = enum {
             .{ "zoom-fit-page", .zoom_fit_page },
             .{ "zoom-fit-width", .zoom_fit_width },
             .{ "zoom-original", .zoom_original },
+            .{ "increase-pages-per-row", .increase_pages_per_row },
+            .{ "decrease-pages-per-row", .decrease_pages_per_row },
+            .{ "single-page-mode", .single_page_mode },
+            .{ "double-page-mode", .double_page_mode },
             .{ "quit", .quit },
             .{ "refresh", .refresh },
             .{ "toggle-fullscreen", .toggle_fullscreen },

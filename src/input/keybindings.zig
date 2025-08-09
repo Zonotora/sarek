@@ -66,6 +66,12 @@ pub const KeyBindings = struct {
         try self.bindings.append(.{ .key = 'F', .modifiers = 0, .command = .toggle_fullscreen });
         try self.bindings.append(.{ .key = 65307, .modifiers = 0, .command = .quit }); // Escape
         
+        // Layout controls
+        try self.bindings.append(.{ .key = '>', .modifiers = 0, .command = .increase_pages_per_row });
+        try self.bindings.append(.{ .key = '<', .modifiers = 0, .command = .decrease_pages_per_row });
+        try self.bindings.append(.{ .key = '1', .modifiers = 0, .command = .single_page_mode });
+        try self.bindings.append(.{ .key = '2', .modifiers = 0, .command = .double_page_mode });
+        
         // Search
         try self.bindings.append(.{ .key = '/', .modifiers = 0, .command = .search_forward });
         try self.bindings.append(.{ .key = '?', .modifiers = 0, .command = .search_backward });
