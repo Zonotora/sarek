@@ -9,7 +9,16 @@ const c = @cImport({
     @cInclude("cairo.h");
 });
 
-const PAGE_OFFSET: f64 = 20.0;
+const MARGIN_LEFT: f64 = 0.0;
+const MARGIN_RIGHT: f64 = 0.0;
+const MARGIN_TOP: f64 = 0.0;
+const MARGIN_BOTTOM: f64 = 0.0;
+const PAGE_OFFSET: f64 = 0.0;
+
+const PAGE_VISIBLE_BUFFER: u32 = 100;
+
+const WINDOW_WIDTH: f64 = 800;
+const WINDOW_HEIGHT: f64 = 640;
 
 const ScrollDirection = enum {
     UP,
@@ -38,7 +47,7 @@ pub const Viewer = struct {
     // Page layout cache
     page_heights: std.ArrayList(f64),
     page_widths: std.ArrayList(f64), // Page widths for layout
-    page_positions: std.ArrayList(f64), // Y positions for each page (row-based)
+    page_y_positions: std.ArrayList(f64), // Y positions for each page (row-based)
     page_x_positions: std.ArrayList(f64), // X positions for each page
 
     // GTK widgets
@@ -62,7 +71,7 @@ pub const Viewer = struct {
 
         var page_heights = std.ArrayList(f64).init(allocator);
         var page_widths = std.ArrayList(f64).init(allocator);
-        var page_positions = std.ArrayList(f64).init(allocator);
+        var page_y_positions = std.ArrayList(f64).init(allocator);
         var page_x_positions = std.ArrayList(f64).init(allocator);
 
         // Pre-calculate page dimensions for layout
@@ -70,14 +79,14 @@ pub const Viewer = struct {
             const page_info = backend_interface.getPageInfo(@intCast(i)) catch {
                 page_heights.deinit();
                 page_widths.deinit();
-                page_positions.deinit();
+                page_y_positions.deinit();
                 page_x_positions.deinit();
                 allocator.destroy(backend_impl);
                 return error.InvalidPdf;
             };
             try page_heights.append(page_info.height);
             try page_widths.append(page_info.width);
-            try page_positions.append(0); // Will be calculated later
+            try page_y_positions.append(0); // Will be calculated later
             try page_x_positions.append(0); // Will be calculated later
         }
 
@@ -95,7 +104,7 @@ pub const Viewer = struct {
             .pages_per_row = 2, // Default to 2 pages side by side (book style)
             .page_heights = page_heights,
             .page_widths = page_widths,
-            .page_positions = page_positions,
+            .page_y_positions = page_y_positions,
             .page_x_positions = page_x_positions,
             .window = null,
             .drawing_area = null,
@@ -108,7 +117,7 @@ pub const Viewer = struct {
         self.keybindings.deinit();
         self.page_heights.deinit();
         self.page_widths.deinit();
-        self.page_positions.deinit();
+        self.page_y_positions.deinit();
         self.page_x_positions.deinit();
         self.allocator.destroy(self.backend_impl);
     }
@@ -140,17 +149,17 @@ pub const Viewer = struct {
 
         // Calculate total dimensions
         var total_height: f64 = 0;
-        var total_width: f64 = 800; // Minimum width
+        var total_width: f64 = WINDOW_WIDTH; // Minimum width
 
         if (self.total_pages > 0) {
             // Find the maximum Y position + page height
             for (0..self.total_pages) |i| {
-                const page_bottom = self.page_positions.items[i] + (self.page_heights.items[i] * self.scale);
+                const page_bottom = self.page_y_positions.items[i] + (self.page_heights.items[i] * self.scale);
                 total_height = @max(total_height, page_bottom);
 
                 // Find the maximum X position + page width
                 const page_right = self.page_x_positions.items[i] + (self.page_widths.items[i] * self.scale);
-                total_width = @max(total_width, page_right + 50); // Add right margin
+                total_width = @max(total_width, page_right + MARGIN_RIGHT); // Add right margin
             }
         }
 
@@ -215,6 +224,12 @@ pub const Viewer = struct {
                 self.updateDrawingAreaSize();
                 self.redraw();
             },
+            .zoom_fit_page => {
+                self.zoomFitPage();
+            },
+            .zoom_fit_width => {
+                self.zoomFitWidth();
+            },
             .quit => {
                 c.gtk_main_quit();
             },
@@ -265,9 +280,8 @@ pub const Viewer = struct {
 
     fn recalculatePagePositions(self: *Self) void {
         var current_y: f64 = 0;
-        var current_x: f64 = 50; // Left margin
+        var current_x: f64 = MARGIN_LEFT;
         var row_height: f64 = 0;
-        const page_margin: f64 = 20; // Space between pages horizontally
 
         for (0..self.total_pages) |i| {
             const page = @as(u32, @intCast(i));
@@ -280,22 +294,31 @@ pub const Viewer = struct {
 
             if (col == 0) {
                 // First page in row - reset X and calculate Y
-                current_x = 50; // Left margin
+                current_x = MARGIN_LEFT; // Left margin
                 if (row > 0) {
                     current_y += row_height + self.page_spacing;
                 }
                 row_height = 0; // Reset for new row
             }
 
+            // Add top margin if first page
+            if (row == 0 and col == 0) {
+                current_y += MARGIN_TOP;
+            }
+
             // Set positions for this page
-            self.page_positions.items[i] = current_y;
+            self.page_y_positions.items[i] = current_y;
             self.page_x_positions.items[i] = current_x;
 
             // Update row height to max height in this row
             row_height = @max(row_height, page_height);
 
             // Advance X position for next page in row
-            current_x += page_width + page_margin;
+            current_x += page_width + PAGE_OFFSET;
+        }
+
+        for (self.page_y_positions.items, 0..) |item, index| {
+            std.debug.print("{}={}\n", .{ index, item });
         }
     }
 
@@ -305,17 +328,17 @@ pub const Viewer = struct {
 
         // Calculate total dimensions
         var total_height: f64 = 0;
-        var total_width: f64 = 800; // Minimum width
+        var total_width: f64 = WINDOW_WIDTH; // Minimum width
 
         if (self.total_pages > 0) {
             // Find the maximum Y position + page height
             for (0..self.total_pages) |i| {
-                const page_bottom = self.page_positions.items[i] + (self.page_heights.items[i] * self.scale);
+                const page_bottom = self.page_y_positions.items[i] + (self.page_heights.items[i] * self.scale);
                 total_height = @max(total_height, page_bottom);
 
                 // Find the maximum X position + page width
                 const page_right = self.page_x_positions.items[i] + (self.page_widths.items[i] * self.scale);
-                total_width = @max(total_width, page_right + 50); // Add right margin
+                total_width = @max(total_width, page_right + MARGIN_RIGHT); // Add right margin
             }
         }
 
@@ -332,7 +355,7 @@ pub const Viewer = struct {
 
     fn getPageYPosition(self: *Self, page: u32) f64 {
         if (page >= self.total_pages) return 0;
-        return self.page_positions.items[page];
+        return self.page_y_positions.items[page];
     }
 
     fn getVisiblePageRange(self: *Self) struct { first: u32, last: u32 } {
@@ -353,11 +376,11 @@ pub const Viewer = struct {
         for (0..self.total_pages) |page_idx| {
             const page = @as(u32, @intCast(page_idx));
             const page_height = self.page_heights.items[page_idx] * self.scale;
-            const page_top = self.page_positions.items[page_idx];
+            const page_top = self.page_y_positions.items[page_idx];
             const page_bottom = page_top + page_height;
 
             // Check if page is visible (overlaps with viewport with buffer)
-            if (page_bottom >= scroll_top - 100 and page_top <= scroll_bottom + 100) { // 100px buffer
+            if (page_bottom >= scroll_top - PAGE_VISIBLE_BUFFER and page_top <= scroll_bottom + PAGE_VISIBLE_BUFFER) {
                 if (first_visible == null) {
                     first_visible = page;
                 }
@@ -400,6 +423,107 @@ pub const Viewer = struct {
         //         std.debug.print("curr={} step={}\n", .{ current_val, step });
         //     }
         // }
+    }
+
+    fn getViewportSize(self: *Self) struct { width: f64, height: f64 } {
+        // Try to get the actual viewport size from the scrolled window
+        if (self.scrolled_window) |scrolled| {
+            const hadjustment = c.gtk_scrolled_window_get_hadjustment(@ptrCast(scrolled));
+            const vadjustment = c.gtk_scrolled_window_get_vadjustment(@ptrCast(scrolled));
+
+            var viewport_width: f64 = WINDOW_WIDTH;
+            var viewport_height: f64 = WINDOW_HEIGHT;
+
+            if (hadjustment) |hadj| {
+                const page_size = c.gtk_adjustment_get_page_size(hadj);
+                if (page_size > 0) {
+                    viewport_width = page_size;
+                }
+            }
+
+            if (vadjustment) |vadj| {
+                const page_size = c.gtk_adjustment_get_page_size(vadj);
+                if (page_size > 0) {
+                    viewport_height = page_size;
+                }
+            }
+
+            std.debug.print("w={} h={}\n", .{ @as(u64, @intFromFloat(viewport_width)), @as(u64, @intFromFloat(viewport_height)) });
+
+            return .{ .width = viewport_width, .height = viewport_height };
+        }
+
+        // Fallback to window size if available
+        if (self.window) |window| {
+            var width: c_int = undefined;
+            var height: c_int = undefined;
+            c.gtk_window_get_size(@ptrCast(window), &width, &height);
+            if (width > 0 and height > 0) {
+                return .{ .width = @floatFromInt(width), .height = @floatFromInt(height) };
+            }
+        }
+
+        // Default fallback size
+        return .{ .width = WINDOW_WIDTH, .height = WINDOW_HEIGHT };
+    }
+
+    fn zoomFitPage(self: *Self) void {
+        if (self.current_page >= self.total_pages) return;
+
+        const page_info = self.backend.getPageInfo(self.current_page) catch return;
+        const viewport = self.getViewportSize();
+
+        // TODO: Not sure we should take y-margins into account
+        const available_width = viewport.width - (MARGIN_LEFT + MARGIN_RIGHT);
+        const available_height = viewport.height; // - (MARGIN_TOP + MARGIN_BOTTOM);
+
+        if (available_width <= 0 or available_height <= 0) return;
+
+        // Calculate scale to fit both width and height
+        const width_scale = available_width / page_info.width;
+        const height_scale = available_height / page_info.height;
+
+        // Use the smaller scale to ensure the entire page fits
+        self.scale = @max(0.1, @min(5.0, @min(width_scale, height_scale)));
+
+        self.updateDrawingAreaSize();
+        self.redraw();
+        std.debug.print("Zoom fit page: scale = {d:.2}\n", .{self.scale});
+    }
+
+    fn zoomFitWidth(self: *Self) void {
+        if (self.current_page >= self.total_pages) return;
+
+        const page_info = self.backend.getPageInfo(self.current_page) catch return;
+        const viewport = self.getViewportSize();
+
+        const available_width = viewport.width - (MARGIN_LEFT + MARGIN_RIGHT);
+
+        if (available_width <= 0) return;
+
+        // For multi-page layouts, consider the total width of all pages in a row
+        var total_row_width: f64 = 0;
+        const current_row = self.current_page / self.pages_per_row;
+        const pages_in_row = @min(self.pages_per_row, self.total_pages - current_row * self.pages_per_row);
+
+        for (0..pages_in_row) |i| {
+            const page_idx = current_row * self.pages_per_row + i;
+            if (page_idx < self.total_pages) {
+                const page_width = self.page_widths.items[page_idx];
+                total_row_width += page_width;
+                if (i > 0) total_row_width += PAGE_OFFSET; // Add margin between pages
+            }
+        }
+
+        if (total_row_width > 0) {
+            self.scale = @max(0.1, @min(5.0, available_width / total_row_width));
+        } else {
+            self.scale = @max(0.1, @min(5.0, available_width / page_info.width));
+        }
+
+        self.updateDrawingAreaSize();
+        self.redraw();
+        std.debug.print("Zoom fit width: scale = {d:.2}\n", .{self.scale});
     }
 };
 
@@ -589,7 +713,7 @@ fn onDraw(_: *c.GtkWidget, ctx: *c.cairo_t, user_data: ?*anyopaque) callconv(.C)
         c.cairo_save(ctx);
 
         // Translate to the page position
-        c.cairo_translate(ctx, page_x, page_y + 10); // Use calculated X position, 10px top margin
+        c.cairo_translate(ctx, page_x, page_y);
 
         // Draw white background for the page
         const page_info = viewer.backend.getPageInfo(page) catch {
