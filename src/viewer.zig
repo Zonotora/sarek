@@ -184,16 +184,13 @@ pub const Viewer = struct {
     fn executeCommand(self: *Self, command: commands.Command) void {
         switch (command) {
             .next_page => {
-                if (self.current_page + 1 < self.total_pages) {
-                    self.current_page += 1;
-                    self.scrollToPage(self.current_page);
-                }
+                self.current_page += self.pages_per_row;
+                if (self.current_page >= self.total_pages) self.current_page = self.total_pages - 1;
+                self.scrollToPage(self.current_page);
             },
             .prev_page => {
-                if (self.current_page > 0) {
-                    self.current_page -= 1;
-                    self.scrollToPage(self.current_page);
-                }
+                self.current_page = if (self.pages_per_row > self.current_page) 0 else self.current_page - self.pages_per_row;
+                self.scrollToPage(self.current_page);
             },
             .first_page => {
                 self.current_page = 0;
