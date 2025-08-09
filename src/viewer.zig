@@ -16,6 +16,7 @@ const MARGIN_BOTTOM: f64 = 0.0;
 const PAGE_OFFSET: f64 = 0.0;
 
 const PAGE_VISIBLE_BUFFER: u32 = 100;
+const MAX_PAGES_PER_ROW: u32 = 6;
 
 const WINDOW_WIDTH: f64 = 800;
 const WINDOW_HEIGHT: f64 = 640;
@@ -24,6 +25,8 @@ const ScrollDirection = enum {
     UP,
     DOWN,
 };
+
+const Dimension = struct { width: f64, height: f64 };
 
 pub const Viewer = struct {
     const Self = @This();
@@ -41,7 +44,6 @@ pub const Viewer = struct {
     // Multi-page rendering state
     scroll_y: f64,
     page_spacing: f64,
-    pages_per_view: u32,
     pages_per_row: u32, // Number of pages to display side by side
 
     // Page layout cache
@@ -100,7 +102,6 @@ pub const Viewer = struct {
             .scale = 1.0,
             .scroll_y = 0.0,
             .page_spacing = PAGE_OFFSET,
-            .pages_per_view = @min(total_pages, 3), // Show up to 3 pages at once
             .pages_per_row = 2, // Default to 2 pages side by side (book style)
             .page_heights = page_heights,
             .page_widths = page_widths,
@@ -147,24 +148,7 @@ pub const Viewer = struct {
         // Initialize page positions with current scale
         self.recalculatePagePositions();
 
-        // Calculate total dimensions
-        var total_height: f64 = 0;
-        var total_width: f64 = WINDOW_WIDTH; // Minimum width
-
-        if (self.total_pages > 0) {
-            // Find the maximum Y position + page height
-            for (0..self.total_pages) |i| {
-                const page_bottom = self.page_y_positions.items[i] + (self.page_heights.items[i] * self.scale);
-                total_height = @max(total_height, page_bottom);
-
-                // Find the maximum X position + page width
-                const page_right = self.page_x_positions.items[i] + (self.page_widths.items[i] * self.scale);
-                total_width = @max(total_width, page_right + MARGIN_RIGHT); // Add right margin
-            }
-        }
-
-        // Set drawing area size
-        c.gtk_widget_set_size_request(self.drawing_area, @intFromFloat(total_width), @intFromFloat(total_height));
+        self.updateDrawingAreaSize();
 
         c.gtk_container_add(@ptrCast(self.scrolled_window), self.drawing_area);
         c.gtk_container_add(@ptrCast(self.window), self.scrolled_window);
@@ -240,8 +224,9 @@ pub const Viewer = struct {
                 self.scroll(ScrollDirection.DOWN);
             },
             .increase_pages_per_row => {
-                if (self.pages_per_row < 6) { // Max 6 pages per row
+                if (self.pages_per_row < MAX_PAGES_PER_ROW) {
                     self.pages_per_row += 1;
+                    self.zoomFitWidth();
                     self.updateDrawingAreaSize();
                     self.redraw();
                     std.debug.print("Pages per row: {}\n", .{self.pages_per_row});
@@ -250,6 +235,7 @@ pub const Viewer = struct {
             .decrease_pages_per_row => {
                 if (self.pages_per_row > 1) {
                     self.pages_per_row -= 1;
+                    self.zoomFitWidth();
                     self.updateDrawingAreaSize();
                     self.redraw();
                     std.debug.print("Pages per row: {}\n", .{self.pages_per_row});
@@ -281,16 +267,45 @@ pub const Viewer = struct {
     fn recalculatePagePositions(self: *Self) void {
         var current_y: f64 = 0;
         var current_x: f64 = MARGIN_LEFT;
+
+        var total_width: f64 = WINDOW_WIDTH; // Minimum width
+
+        var row_width: f64 = 0;
         var row_height: f64 = 0;
+        var last_row: u32 = 0;
+
+        var row_heights = std.ArrayList(f64).init(self.allocator);
 
         for (0..self.total_pages) |i| {
             const page = @as(u32, @intCast(i));
-            const page_height = self.page_heights.items[i] * self.scale;
-            const page_width = self.page_widths.items[i] * self.scale;
+            const row = page / self.pages_per_row;
 
-            // Calculate row and column within row
+            if (row != last_row) {
+                // TODO: Error
+                row_heights.append(row_height) catch {};
+                total_width = @max(total_width, row_width);
+
+                row_width = 0;
+                row_height = 0;
+            }
+
+            row_height = @max(row_height, self.page_heights.items[i] * self.scale) + PAGE_OFFSET;
+            row_width += self.page_widths.items[i] * self.scale + PAGE_OFFSET;
+
+            last_row = row;
+        }
+
+        const page_total_width = total_width / @as(f64, @floatFromInt(self.pages_per_row));
+
+        for (0..self.total_pages) |i| {
+            const page = @as(u32, @intCast(i));
             const row = page / self.pages_per_row;
             const col = page % self.pages_per_row;
+
+            const page_width = self.page_widths.items[i] * self.scale;
+            const page_height = self.page_heights.items[i] * self.scale;
+            const page_x_offset = (page_total_width - page_width) / 2;
+            const page_y_offset = if (row < row_heights.items.len) (row_heights.items[row] - page_height) / 2 else 0;
 
             if (col == 0) {
                 // First page in row - reset X and calculate Y
@@ -307,18 +322,14 @@ pub const Viewer = struct {
             }
 
             // Set positions for this page
-            self.page_y_positions.items[i] = current_y;
-            self.page_x_positions.items[i] = current_x;
+            self.page_y_positions.items[i] = current_y + page_y_offset;
+            self.page_x_positions.items[i] = current_x + page_x_offset;
 
             // Update row height to max height in this row
             row_height = @max(row_height, page_height);
 
             // Advance X position for next page in row
-            current_x += page_width + PAGE_OFFSET;
-        }
-
-        for (self.page_y_positions.items, 0..) |item, index| {
-            std.debug.print("{}={}\n", .{ index, item });
+            current_x += page_width + 2 * page_x_offset + PAGE_OFFSET;
         }
     }
 
@@ -330,16 +341,13 @@ pub const Viewer = struct {
         var total_height: f64 = 0;
         var total_width: f64 = WINDOW_WIDTH; // Minimum width
 
-        if (self.total_pages > 0) {
-            // Find the maximum Y position + page height
-            for (0..self.total_pages) |i| {
-                const page_bottom = self.page_y_positions.items[i] + (self.page_heights.items[i] * self.scale);
-                total_height = @max(total_height, page_bottom);
+        for (0..self.total_pages) |i| {
+            const page_bottom = self.page_y_positions.items[i] + (self.page_heights.items[i] * self.scale);
+            total_height = @max(total_height, page_bottom);
 
-                // Find the maximum X position + page width
-                const page_right = self.page_x_positions.items[i] + (self.page_widths.items[i] * self.scale);
-                total_width = @max(total_width, page_right + MARGIN_RIGHT); // Add right margin
-            }
+            // Find the maximum X position + page width
+            const page_right = self.page_x_positions.items[i] + (self.page_widths.items[i] * self.scale);
+            total_width = @max(total_width, page_right + MARGIN_RIGHT); // Add right margin
         }
 
         if (self.drawing_area) |area| {
@@ -425,7 +433,7 @@ pub const Viewer = struct {
         // }
     }
 
-    fn getViewportSize(self: *Self) struct { width: f64, height: f64 } {
+    fn getViewportSize(self: *Self) Dimension {
         // Try to get the actual viewport size from the scrolled window
         if (self.scrolled_window) |scrolled| {
             const hadjustment = c.gtk_scrolled_window_get_hadjustment(@ptrCast(scrolled));
