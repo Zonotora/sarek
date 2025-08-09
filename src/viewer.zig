@@ -26,6 +26,12 @@ const ScrollDirection = enum {
     DOWN,
 };
 
+const FitMode = enum {
+    NONE,
+    FIT_PAGE,
+    FIT_WIDTH,
+};
+
 const Dimension = struct { width: f64, height: f64 };
 
 pub const Viewer = struct {
@@ -40,6 +46,7 @@ pub const Viewer = struct {
     current_page: u32,
     total_pages: u32,
     scale: f64,
+    fit_mode: FitMode,
 
     // Multi-page rendering state
     scroll_y: f64,
@@ -47,6 +54,7 @@ pub const Viewer = struct {
     pages_per_row: u32, // Number of pages to display side by side
 
     // Page layout cache
+    row_max_heights: std.ArrayList(f64),
     page_heights: std.ArrayList(f64),
     page_widths: std.ArrayList(f64), // Page widths for layout
     page_y_positions: std.ArrayList(f64), // Y positions for each page (row-based)
@@ -71,6 +79,7 @@ pub const Viewer = struct {
             return error.InvalidPdf;
         }
 
+        var row_max_heights = std.ArrayList(f64).init(allocator);
         var page_heights = std.ArrayList(f64).init(allocator);
         var page_widths = std.ArrayList(f64).init(allocator);
         var page_y_positions = std.ArrayList(f64).init(allocator);
@@ -86,6 +95,7 @@ pub const Viewer = struct {
                 allocator.destroy(backend_impl);
                 return error.InvalidPdf;
             };
+            try row_max_heights.append(page_info.height);
             try page_heights.append(page_info.height);
             try page_widths.append(page_info.width);
             try page_y_positions.append(0); // Will be calculated later
@@ -100,9 +110,11 @@ pub const Viewer = struct {
             .current_page = 0,
             .total_pages = total_pages,
             .scale = 1.0,
+            .fit_mode = .NONE,
             .scroll_y = 0.0,
             .page_spacing = PAGE_OFFSET,
-            .pages_per_row = 2, // Default to 2 pages side by side (book style)
+            .pages_per_row = 2,
+            .row_max_heights = row_max_heights,
             .page_heights = page_heights,
             .page_widths = page_widths,
             .page_y_positions = page_y_positions,
@@ -116,6 +128,7 @@ pub const Viewer = struct {
     pub fn deinit(self: *Self) void {
         self.backend.deinit();
         self.keybindings.deinit();
+        self.row_max_heights.deinit();
         self.page_heights.deinit();
         self.page_widths.deinit();
         self.page_y_positions.deinit();
@@ -156,6 +169,7 @@ pub const Viewer = struct {
         // Connect signals
         _ = c.g_signal_connect_data(self.window, "destroy", @ptrCast(&onDestroy), null, null, 0);
         _ = c.g_signal_connect_data(self.drawing_area, "draw", @ptrCast(&onDraw), self, null, 0);
+        _ = c.g_signal_connect_data(self.window, "configure-event", @ptrCast(&onWindowResize), self, null, 0);
 
         // _ = c.g_signal_connect_data(self.window, "scroll_event", @ptrCast(&onScroll), self, null, 0);
 
@@ -194,25 +208,32 @@ pub const Viewer = struct {
                 self.scrollToPage(self.current_page);
             },
             .zoom_in => {
+                self.fit_mode = .NONE; // Disable fit mode when manually zooming
                 self.scale = @min(self.scale * 1.2, 5.0);
                 self.updateDrawingAreaSize();
                 self.redraw();
             },
             .zoom_out => {
+                self.fit_mode = .NONE; // Disable fit mode when manually zooming
                 self.scale = @max(self.scale / 1.2, 0.1);
                 self.updateDrawingAreaSize();
                 self.redraw();
             },
             .zoom_original => {
+                self.fit_mode = .NONE; // Disable fit mode when manually zooming
                 self.scale = 1.0;
                 self.updateDrawingAreaSize();
                 self.redraw();
             },
             .zoom_fit_page => {
                 self.zoomFitPage();
+                self.updateDrawingAreaSize();
+                self.redraw();
             },
             .zoom_fit_width => {
                 self.zoomFitWidth();
+                self.updateDrawingAreaSize();
+                self.redraw();
             },
             .quit => {
                 c.gtk_main_quit();
@@ -226,7 +247,6 @@ pub const Viewer = struct {
             .increase_pages_per_row => {
                 if (self.pages_per_row < MAX_PAGES_PER_ROW) {
                     self.pages_per_row += 1;
-                    self.zoomFitWidth();
                     self.updateDrawingAreaSize();
                     self.redraw();
                     std.debug.print("Pages per row: {}\n", .{self.pages_per_row});
@@ -235,7 +255,6 @@ pub const Viewer = struct {
             .decrease_pages_per_row => {
                 if (self.pages_per_row > 1) {
                     self.pages_per_row -= 1;
-                    self.zoomFitWidth();
                     self.updateDrawingAreaSize();
                     self.redraw();
                     std.debug.print("Pages per row: {}\n", .{self.pages_per_row});
@@ -268,21 +287,17 @@ pub const Viewer = struct {
         var current_y: f64 = 0;
         var current_x: f64 = MARGIN_LEFT;
 
-        var total_width: f64 = WINDOW_WIDTH; // Minimum width
-
+        var total_width: f64 = 0;
         var row_width: f64 = 0;
         var row_height: f64 = 0;
         var last_row: u32 = 0;
-
-        var row_heights = std.ArrayList(f64).init(self.allocator);
 
         for (0..self.total_pages) |i| {
             const page = @as(u32, @intCast(i));
             const row = page / self.pages_per_row;
 
             if (row != last_row) {
-                // TODO: Error
-                row_heights.append(row_height) catch {};
+                self.row_max_heights.items[row - 1] = row_height;
                 total_width = @max(total_width, row_width);
 
                 row_width = 0;
@@ -295,7 +310,9 @@ pub const Viewer = struct {
             last_row = row;
         }
 
-        const page_total_width = total_width / @as(f64, @floatFromInt(self.pages_per_row));
+        row_height = 0;
+
+        const row_max_width = total_width / @as(f64, @floatFromInt(self.pages_per_row));
 
         for (0..self.total_pages) |i| {
             const page = @as(u32, @intCast(i));
@@ -304,12 +321,13 @@ pub const Viewer = struct {
 
             const page_width = self.page_widths.items[i] * self.scale;
             const page_height = self.page_heights.items[i] * self.scale;
-            const page_x_offset = (page_total_width - page_width) / 2;
-            const page_y_offset = if (row < row_heights.items.len) (row_heights.items[row] - page_height) / 2 else 0;
+            const page_x_offset = (row_max_width - page_width) / 2;
+            const page_y_offset = (self.row_max_heights.items[row] - page_height) / 2;
+            std.debug.print("i={} {d:.2} {d:.2}\n", .{ i, self.row_max_heights.items[row], page_height });
 
             if (col == 0) {
                 // First page in row - reset X and calculate Y
-                current_x = MARGIN_LEFT; // Left margin
+                current_x = MARGIN_LEFT;
                 if (row > 0) {
                     current_y += row_height + self.page_spacing;
                 }
@@ -334,6 +352,11 @@ pub const Viewer = struct {
     }
 
     fn updateDrawingAreaSize(self: *Self) void {
+        switch (self.fit_mode) {
+            .FIT_PAGE => self.zoomFitPage(),
+            .FIT_WIDTH => self.zoomFitWidth(),
+            .NONE => {},
+        }
         // Recalculate positions with new scale
         self.recalculatePagePositions();
 
@@ -456,7 +479,7 @@ pub const Viewer = struct {
                 }
             }
 
-            std.debug.print("w={} h={}\n", .{ @as(u64, @intFromFloat(viewport_width)), @as(u64, @intFromFloat(viewport_height)) });
+            // std.debug.print("w={} h={}\n", .{ @as(u64, @intFromFloat(viewport_width)), @as(u64, @intFromFloat(viewport_height)) });
 
             return .{ .width = viewport_width, .height = viewport_height };
         }
@@ -478,6 +501,8 @@ pub const Viewer = struct {
     fn zoomFitPage(self: *Self) void {
         if (self.current_page >= self.total_pages) return;
 
+        self.fit_mode = .FIT_PAGE;
+
         const page_info = self.backend.getPageInfo(self.current_page) catch return;
         const viewport = self.getViewportSize();
 
@@ -494,13 +519,13 @@ pub const Viewer = struct {
         // Use the smaller scale to ensure the entire page fits
         self.scale = @max(0.1, @min(5.0, @min(width_scale, height_scale)));
 
-        self.updateDrawingAreaSize();
-        self.redraw();
-        std.debug.print("Zoom fit page: scale = {d:.2}\n", .{self.scale});
+        // std.debug.print("Zoom fit page: scale = {d:.2}\n", .{self.scale});
     }
 
     fn zoomFitWidth(self: *Self) void {
         if (self.current_page >= self.total_pages) return;
+
+        self.fit_mode = .FIT_WIDTH; // Set fit mode
 
         const page_info = self.backend.getPageInfo(self.current_page) catch return;
         const viewport = self.getViewportSize();
@@ -528,15 +553,36 @@ pub const Viewer = struct {
         } else {
             self.scale = @max(0.1, @min(5.0, available_width / page_info.width));
         }
-
-        self.updateDrawingAreaSize();
-        self.redraw();
-        std.debug.print("Zoom fit width: scale = {d:.2}\n", .{self.scale});
+        // std.debug.print("Zoom fit width: scale = {d:.2}\n", .{self.scale});
     }
 };
 
 fn onDestroy(_: *c.GtkWidget, _: ?*anyopaque) callconv(.C) void {
     c.gtk_main_quit();
+}
+
+const GdkEventConfigure = extern struct {
+    type: GdkEventType,
+    window: ?*anyopaque,
+    send_event: i8,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+};
+
+fn onWindowResize(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
+    const viewer: *Viewer = @ptrCast(@alignCast(user_data));
+    // _ = event;
+    const gdk_event: *GdkEventConfigure = @ptrCast(@alignCast(event.?));
+
+    // Debug output to see resize events
+    std.debug.print("Window resized to {}x{}\n", .{ gdk_event.width, gdk_event.height });
+
+    viewer.updateDrawingAreaSize();
+    viewer.redraw();
+
+    return 0; // Let other handlers process this event too
 }
 
 pub const GdkEventType = enum(c_int) {
