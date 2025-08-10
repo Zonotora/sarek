@@ -32,6 +32,12 @@ pub const Command = enum {
     refresh,
     toggle_fullscreen,
     
+    // TOC
+    toggle_toc,
+    toc_up,
+    toc_down,
+    toc_select,
+    
     // Search
     search_forward,
     search_backward,
@@ -61,6 +67,10 @@ pub const Command = enum {
             .{ "quit", .quit },
             .{ "refresh", .refresh },
             .{ "toggle-fullscreen", .toggle_fullscreen },
+            .{ "toggle-toc", .toggle_toc },
+            .{ "toc-up", .toc_up },
+            .{ "toc-down", .toc_down },
+            .{ "toc-select", .toc_select },
             .{ "search-forward", .search_forward },
             .{ "search-backward", .search_backward },
             .{ "search-next", .search_next },

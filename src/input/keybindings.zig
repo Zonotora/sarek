@@ -43,7 +43,6 @@ pub const KeyBindings = struct {
         // Page navigation
         try self.bindings.append(.{ .key = 'g', .modifiers = 0, .command = .first_page });
         try self.bindings.append(.{ .key = 'G', .modifiers = SHIFT_MASK, .command = .last_page });
-        try self.bindings.append(.{ .key = 65293, .modifiers = 0, .command = .next_page }); // Return
         try self.bindings.append(.{ .key = 32, .modifiers = 0, .command = .next_page }); // Space
         try self.bindings.append(.{ .key = 65288, .modifiers = 0, .command = .prev_page }); // Backspace
 
@@ -68,6 +67,10 @@ pub const KeyBindings = struct {
         try self.bindings.append(.{ .key = 'r', .modifiers = 0, .command = .refresh });
         try self.bindings.append(.{ .key = 'F', .modifiers = SHIFT_MASK, .command = .toggle_fullscreen });
         try self.bindings.append(.{ .key = 65307, .modifiers = 0, .command = .quit }); // Escape
+        
+        // TOC navigation
+        try self.bindings.append(.{ .key = 65289, .modifiers = 0, .command = .toggle_toc }); // Tab
+        try self.bindings.append(.{ .key = 65293, .modifiers = 0, .command = .toc_select }); // Enter (when in TOC mode)
 
         // Layout controls - shift-modified characters need shift modifier
         try self.bindings.append(.{ .key = '>', .modifiers = SHIFT_MASK, .command = .increase_pages_per_row });

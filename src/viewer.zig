@@ -34,6 +34,16 @@ const FitMode = enum {
 
 const Dimension = struct { width: f64, height: f64 };
 
+const TocMode = enum {
+    HIDDEN,
+    VISIBLE,
+};
+
+const TocDirection = enum {
+    UP,
+    DOWN,
+};
+
 pub const Viewer = struct {
     const Self = @This();
 
@@ -44,7 +54,7 @@ pub const Viewer = struct {
 
     // File info
     filename: []u8,
-    
+
     width: f64,
     height: f64,
 
@@ -53,6 +63,11 @@ pub const Viewer = struct {
     total_pages: u32,
     scale: f64,
     fit_mode: FitMode,
+
+    // TOC state
+    toc_entries: std.ArrayList(backend_mod.TocEntry),
+    toc_mode: TocMode,
+    toc_selected_index: u32,
 
     // Multi-page rendering state
     scroll_y: f64,
@@ -126,6 +141,9 @@ pub const Viewer = struct {
             .total_pages = total_pages,
             .scale = 1.0,
             .fit_mode = .NONE,
+            .toc_entries = std.ArrayList(backend_mod.TocEntry).init(allocator),
+            .toc_mode = .HIDDEN,
+            .toc_selected_index = 0,
             .scroll_y = 0.0,
             .page_spacing = PAGE_OFFSET,
             .pages_per_row = 2,
@@ -144,6 +162,13 @@ pub const Viewer = struct {
         self.backend.deinit();
         self.keybindings.deinit();
         self.allocator.free(self.filename);
+
+        // Clean up TOC entries
+        for (self.toc_entries.items) |*entry| {
+            entry.deinit(self.allocator);
+        }
+        self.toc_entries.deinit();
+
         self.row_max_heights.deinit();
         self.page_heights.deinit();
         self.page_widths.deinit();
@@ -207,6 +232,27 @@ pub const Viewer = struct {
     }
 
     fn executeCommand(self: *Self, command: commands.Command) void {
+        // Handle TOC-specific navigation when TOC is visible
+        if (self.toc_mode == .VISIBLE) {
+            switch (command) {
+                .next_page => {
+                    self.tocNavigate(.DOWN);
+                    return;
+                },
+                .prev_page => {
+                    self.tocNavigate(.UP);
+                    return;
+                },
+                .toggle_toc, .toc_select => {
+                    // Fall through to normal handling
+                },
+                else => {
+                    // Ignore other commands when TOC is visible
+                    return;
+                },
+            }
+        }
+
         switch (command) {
             .next_page => {
                 self.current_page += self.pages_per_row;
@@ -298,6 +344,24 @@ pub const Viewer = struct {
                 self.updateDrawingAreaSize();
                 self.redraw();
             },
+            .toggle_toc => {
+                self.toggleToc();
+            },
+            .toc_up => {
+                if (self.toc_mode == .VISIBLE) {
+                    self.tocNavigate(.UP);
+                }
+            },
+            .toc_down => {
+                if (self.toc_mode == .VISIBLE) {
+                    self.tocNavigate(.DOWN);
+                }
+            },
+            .toc_select => {
+                if (self.toc_mode == .VISIBLE) {
+                    self.tocSelect();
+                }
+            },
             else => {
                 // TODO: Implement remaining commands
                 std.debug.print("Command not implemented: {}\n", .{command});
@@ -306,6 +370,7 @@ pub const Viewer = struct {
     }
 
     fn recalculatePagePositions(self: *Self) void {
+        // TODO: The last page is not drawn properly when fit to page/width.
         var current_y: f64 = 0;
         var current_x: f64 = MARGIN_LEFT;
 
@@ -580,7 +645,7 @@ pub const Viewer = struct {
         // Get the current scroll position and viewport size
         var scroll_top: f64 = 0;
         var viewport_height: f64 = self.height;
-        
+
         if (self.scrolled_window) |scrolled| {
             const vadjustment = c.gtk_scrolled_window_get_vadjustment(@ptrCast(scrolled));
             if (vadjustment) |vadj| {
@@ -588,47 +653,241 @@ pub const Viewer = struct {
                 viewport_height = c.gtk_adjustment_get_page_size(vadj);
             }
         }
-        
+
         // Set up status bar styling
         const status_bar_height: f64 = 20.0;
         const margin: f64 = 5.0;
         const font_size: f64 = 12.0;
-        
+
         // Calculate status bar position relative to the current viewport
         const status_bar_y = scroll_top + viewport_height - status_bar_height;
-        
+
         // Clear the status bar area first with the background color
         c.cairo_save(ctx);
         c.cairo_set_source_rgb(ctx, 0.9, 0.9, 0.9); // Same as main background
         c.cairo_rectangle(ctx, 0, status_bar_y, self.width, status_bar_height);
         c.cairo_fill(ctx);
-        
+
         // Draw status bar background (semi-transparent dark background)
         c.cairo_set_source_rgba(ctx, 0.2, 0.2, 0.2, 0.8);
         c.cairo_rectangle(ctx, 0, status_bar_y, self.width, status_bar_height);
         c.cairo_fill(ctx);
-        
+
         // Set up text properties
         c.cairo_set_source_rgb(ctx, 1.0, 1.0, 1.0); // White text
         c.cairo_select_font_face(ctx, "sans-serif", c.CAIRO_FONT_SLANT_NORMAL, c.CAIRO_FONT_WEIGHT_NORMAL);
         c.cairo_set_font_size(ctx, font_size);
-        
+
         // Draw filename in bottom left (viewport-relative position)
         c.cairo_move_to(ctx, margin, status_bar_y + status_bar_height - margin);
         c.cairo_show_text(ctx, self.filename.ptr);
-        
+
         // Create and draw page info in bottom right (like Zathura: "page/total")
         var page_info_buf: [64]u8 = undefined;
         const page_info_str = std.fmt.bufPrintZ(page_info_buf[0..], "{}/{}", .{ self.current_page + 1, self.total_pages }) catch "?/?";
-        
+
         // Get text width to position it at the right edge
         var text_extents: c.cairo_text_extents_t = undefined;
         c.cairo_text_extents(ctx, page_info_str.ptr, &text_extents);
         const text_width = text_extents.width;
-        
+
         c.cairo_move_to(ctx, self.width - text_width - margin, status_bar_y + status_bar_height - margin);
         c.cairo_show_text(ctx, page_info_str.ptr);
-        
+
+        c.cairo_restore(ctx);
+    }
+
+    fn toggleToc(self: *Self) void {
+        switch (self.toc_mode) {
+            .HIDDEN => {
+                // Try to extract TOC if we haven't done it yet
+                if (self.toc_entries.items.len == 0) {
+                    self.extractToc() catch {
+                        std.debug.print("Failed to extract TOC or no TOC available\n", .{});
+                        return;
+                    };
+                }
+                if (self.toc_entries.items.len > 0) {
+                    self.toc_mode = .VISIBLE;
+                    self.toc_selected_index = 0;
+                    std.debug.print("TOC opened\n", .{});
+                } else {
+                    std.debug.print("No TOC available in this document\n", .{});
+                }
+            },
+            .VISIBLE => {
+                self.toc_mode = .HIDDEN;
+                std.debug.print("TOC closed\n", .{});
+            },
+        }
+        self.redraw();
+    }
+
+    fn tocNavigate(self: *Self, direction: TocDirection) void {
+        if (self.toc_entries.items.len == 0) return;
+
+        switch (direction) {
+            .UP => {
+                if (self.toc_selected_index > 0) {
+                    self.toc_selected_index -= 1;
+                }
+            },
+            .DOWN => {
+                if (self.toc_selected_index < self.toc_entries.items.len - 1) {
+                    self.toc_selected_index += 1;
+                }
+            },
+        }
+        self.redraw();
+    }
+
+    fn tocSelect(self: *Self) void {
+        if (self.toc_entries.items.len == 0 or self.toc_selected_index >= self.toc_entries.items.len) {
+            return;
+        }
+
+        const selected_entry = &self.toc_entries.items[self.toc_selected_index];
+
+        // Navigate to the selected page
+        self.current_page = selected_entry.page;
+        self.scrollToPage(self.current_page);
+
+        // Close TOC
+        self.toc_mode = .HIDDEN;
+        self.redraw();
+
+        std.debug.print("Navigated to page {} ({s})\n", .{ selected_entry.page + 1, selected_entry.title });
+    }
+
+    fn extractToc(self: *Self) !void {
+        // Use the backend to extract real TOC from the PDF
+        try self.backend.extractToc(self.allocator, &self.toc_entries);
+
+        // Clamp page numbers to valid range
+        for (self.toc_entries.items) |*entry| {
+            entry.page = @min(entry.page, self.total_pages - 1);
+        }
+
+        std.debug.print("Extracted {} TOC entries\n", .{self.toc_entries.items.len});
+    }
+
+    fn drawTocOverlay(self: *Self, ctx: *c.cairo_t) void {
+        if (self.toc_entries.items.len == 0) return;
+
+        // Get viewport info for positioning
+        var scroll_top: f64 = 0;
+        var viewport_height: f64 = self.height;
+
+        if (self.scrolled_window) |scrolled| {
+            const vadjustment = c.gtk_scrolled_window_get_vadjustment(@ptrCast(scrolled));
+            if (vadjustment) |vadj| {
+                scroll_top = c.gtk_adjustment_get_value(vadj);
+                viewport_height = c.gtk_adjustment_get_page_size(vadj);
+            }
+        }
+
+        // Draw semi-transparent background covering the entire viewport
+        c.cairo_save(ctx);
+        c.cairo_set_source_rgba(ctx, 0.1, 0.1, 0.1, 0.9); // Dark background
+        c.cairo_rectangle(ctx, 0, scroll_top, self.width, viewport_height);
+        c.cairo_fill(ctx);
+
+        // TOC styling
+        const margin: f64 = 20.0;
+        const line_height: f64 = 25.0;
+        const font_size: f64 = 14.0;
+        const indent_per_level: f64 = 20.0;
+
+        // Calculate visible TOC area
+        const toc_x = margin;
+        const toc_y = scroll_top + margin;
+        const toc_width = self.width - 2 * margin;
+        const toc_height = viewport_height - 2 * margin;
+
+        // Draw TOC background
+        c.cairo_set_source_rgba(ctx, 0.2, 0.2, 0.2, 0.95);
+        c.cairo_rectangle(ctx, toc_x, toc_y, toc_width, toc_height);
+        c.cairo_fill(ctx);
+
+        // Draw TOC border
+        c.cairo_set_source_rgb(ctx, 0.6, 0.6, 0.6);
+        c.cairo_set_line_width(ctx, 1.0);
+        c.cairo_rectangle(ctx, toc_x, toc_y, toc_width, toc_height);
+        c.cairo_stroke(ctx);
+
+        // Draw title
+        c.cairo_set_source_rgb(ctx, 1.0, 1.0, 1.0);
+        c.cairo_select_font_face(ctx, "sans-serif", c.CAIRO_FONT_SLANT_NORMAL, c.CAIRO_FONT_WEIGHT_BOLD);
+        c.cairo_set_font_size(ctx, font_size + 2);
+
+        const title = "Table of Contents";
+        c.cairo_move_to(ctx, toc_x + 10, toc_y + 25);
+        c.cairo_show_text(ctx, title.ptr);
+
+        // Calculate how many entries can fit in the visible area
+        const available_height = toc_height - 50; // Leave space for title and margins
+        const max_visible_entries: u32 = @intFromFloat(available_height / line_height);
+
+        // Calculate scroll offset for TOC entries
+        var toc_scroll_offset: u32 = 0;
+        if (self.toc_selected_index >= max_visible_entries) {
+            toc_scroll_offset = self.toc_selected_index - max_visible_entries + 1;
+        }
+
+        // Set up text properties for entries
+        c.cairo_select_font_face(ctx, "sans-serif", c.CAIRO_FONT_SLANT_NORMAL, c.CAIRO_FONT_WEIGHT_NORMAL);
+        c.cairo_set_font_size(ctx, font_size);
+
+        // Draw TOC entries
+        var y_pos = toc_y + 50; // Start after title
+        const end_idx = @min(toc_scroll_offset + max_visible_entries, @as(u32, @intCast(self.toc_entries.items.len)));
+
+        for (toc_scroll_offset..end_idx) |i| {
+            const entry = &self.toc_entries.items[i];
+            const is_selected = (i == self.toc_selected_index);
+
+            // Draw selection highlight
+            if (is_selected) {
+                c.cairo_set_source_rgba(ctx, 0.4, 0.4, 0.6, 0.7);
+                c.cairo_rectangle(ctx, toc_x + 5, y_pos - line_height + 5, toc_width - 10, line_height);
+                c.cairo_fill(ctx);
+            }
+
+            // Set text color
+            if (is_selected) {
+                c.cairo_set_source_rgb(ctx, 1.0, 1.0, 1.0); // White for selected
+            } else {
+                c.cairo_set_source_rgb(ctx, 0.9, 0.9, 0.9); // Light gray for unselected
+            }
+
+            // Calculate indentation based on level
+            const indent = @as(f64, @floatFromInt(entry.level)) * indent_per_level;
+
+            // Draw the title
+            c.cairo_move_to(ctx, toc_x + 10 + indent, y_pos);
+            c.cairo_show_text(ctx, entry.title.ptr);
+
+            // Draw page number on the right
+            var page_buf: [16]u8 = undefined;
+            const page_str = std.fmt.bufPrintZ(page_buf[0..], "{}", .{entry.page + 1}) catch "?";
+
+            var text_extents: c.cairo_text_extents_t = undefined;
+            c.cairo_text_extents(ctx, page_str.ptr, &text_extents);
+            const page_x = toc_x + toc_width - text_extents.width - 15;
+
+            c.cairo_move_to(ctx, page_x, y_pos);
+            c.cairo_show_text(ctx, page_str.ptr);
+
+            y_pos += line_height;
+        }
+
+        // Draw navigation instructions at the bottom
+        c.cairo_set_source_rgb(ctx, 0.7, 0.7, 0.7);
+        c.cairo_set_font_size(ctx, 10);
+        const instructions = "j/k: navigate, Enter: select, Tab: close";
+        c.cairo_move_to(ctx, toc_x + 10, toc_y + toc_height - 10);
+        c.cairo_show_text(ctx, instructions.ptr);
+
         c.cairo_restore(ctx);
     }
 };
@@ -829,16 +1088,16 @@ fn onScroll(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callcon
 
 fn updateCurrentPageFromScroll(user_data: ?*anyopaque) callconv(.C) c.gboolean {
     const viewer: *Viewer = @ptrCast(@alignCast(user_data));
-    
+
     // Get the currently visible page range
     const visible_range = viewer.getVisiblePageRange();
-    
+
     // Update current_page to the first visible page
     viewer.current_page = visible_range.first;
-    
+
     // Trigger another redraw to update the status bar with the new page number
     viewer.redraw();
-    
+
     return 0; // Don't repeat this idle callback
 }
 
@@ -896,6 +1155,11 @@ fn onDraw(_: *c.GtkWidget, ctx: *c.cairo_t, user_data: ?*anyopaque) callconv(.C)
 
     // Draw status bar at the bottom of the viewport (like Zathura) - only once, outside the page loop
     viewer.drawStatusBar(ctx);
+
+    // Draw TOC overlay if visible
+    if (viewer.toc_mode == .VISIBLE) {
+        viewer.drawTocOverlay(ctx);
+    }
 
     return 0;
 }

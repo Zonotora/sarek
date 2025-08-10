@@ -13,6 +13,16 @@ pub const PageInfo = struct {
     height: f64,
 };
 
+pub const TocEntry = struct {
+    title: []u8,
+    page: u32,
+    level: u32,
+    
+    pub fn deinit(self: *TocEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.title);
+    }
+};
+
 pub const Backend = struct {
     const Self = @This();
     
@@ -25,6 +35,7 @@ pub const Backend = struct {
         get_page_count: *const fn (ptr: *anyopaque) u32,
         get_page_info: *const fn (ptr: *anyopaque, page: u32) PdfError!PageInfo,
         render_page: *const fn (ptr: *anyopaque, page: u32, cairo_ctx: *anyopaque, scale: f64) PdfError!void,
+        extract_toc: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, toc_entries: *std.ArrayList(TocEntry)) PdfError!void,
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
@@ -46,6 +57,10 @@ pub const Backend = struct {
 
     pub fn renderPage(self: Self, page: u32, cairo_ctx: *anyopaque, scale: f64) PdfError!void {
         return self.vtable.render_page(self.ptr, page, cairo_ctx, scale);
+    }
+
+    pub fn extractToc(self: Self, allocator: std.mem.Allocator, toc_entries: *std.ArrayList(TocEntry)) PdfError!void {
+        return self.vtable.extract_toc(self.ptr, allocator, toc_entries);
     }
 
     pub fn deinit(self: Self) void {
