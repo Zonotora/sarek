@@ -44,6 +44,54 @@ const TocDirection = enum {
     DOWN,
 };
 
+const SelectionState = enum {
+    NONE,
+    SELECTING,
+    SELECTED,
+};
+
+const TextSelectionInfo = struct {
+    state: SelectionState,
+    start_page: u32,
+    start_x: f64,
+    start_y: f64,
+    end_page: u32,
+    end_x: f64,
+    end_y: f64,
+    selection_rect: backend_mod.TextRect,
+    selected_text: []u8,
+    allocator: ?std.mem.Allocator,
+    
+    pub fn init() TextSelectionInfo {
+        return TextSelectionInfo{
+            .state = .NONE,
+            .start_page = 0,
+            .start_x = 0,
+            .start_y = 0,
+            .end_page = 0,
+            .end_x = 0,
+            .end_y = 0,
+            .selection_rect = backend_mod.TextRect{ .x1 = 0, .y1 = 0, .x2 = 0, .y2 = 0 },
+            .selected_text = &[_]u8{},
+            .allocator = null,
+        };
+    }
+    
+    pub fn deinit(self: *TextSelectionInfo) void {
+        if (self.allocator) |allocator| {
+            if (self.selected_text.len > 0) {
+                allocator.free(self.selected_text);
+                self.selected_text = &[_]u8{};
+            }
+        }
+    }
+    
+    pub fn clear(self: *TextSelectionInfo) void {
+        self.deinit();
+        self.state = .NONE;
+    }
+};
+
 pub const Viewer = struct {
     const Self = @This();
 
@@ -68,6 +116,10 @@ pub const Viewer = struct {
     toc_entries: std.ArrayList(backend_mod.TocEntry),
     toc_mode: TocMode,
     toc_selected_index: u32,
+
+    // Text selection state
+    text_selection: TextSelectionInfo,
+    highlights: std.ArrayList(backend_mod.Highlight),
 
     // Multi-page rendering state
     scroll_y: f64,
@@ -144,6 +196,12 @@ pub const Viewer = struct {
             .toc_entries = std.ArrayList(backend_mod.TocEntry).init(allocator),
             .toc_mode = .HIDDEN,
             .toc_selected_index = 0,
+            .text_selection = blk: {
+                var selection = TextSelectionInfo.init();
+                selection.allocator = allocator;
+                break :blk selection;
+            },
+            .highlights = std.ArrayList(backend_mod.Highlight).init(allocator),
             .scroll_y = 0.0,
             .page_spacing = PAGE_OFFSET,
             .pages_per_row = 2,
@@ -168,6 +226,15 @@ pub const Viewer = struct {
             entry.deinit(self.allocator);
         }
         self.toc_entries.deinit();
+
+        // Clean up text selection
+        self.text_selection.deinit();
+
+        // Clean up highlights
+        for (self.highlights.items) |*highlight| {
+            highlight.deinit(self.allocator);
+        }
+        self.highlights.deinit();
 
         self.row_max_heights.deinit();
         self.page_heights.deinit();
@@ -219,6 +286,12 @@ pub const Viewer = struct {
         // Add key event handling
         c.gtk_widget_add_events(self.window, c.GDK_KEY_PRESS_MASK);
         _ = c.g_signal_connect_data(self.window, "key_press_event", @ptrCast(&onKeyPress), self, null, 0);
+
+        // Add mouse event handling for text selection
+        c.gtk_widget_add_events(self.drawing_area, c.GDK_BUTTON_PRESS_MASK | c.GDK_BUTTON_RELEASE_MASK | c.GDK_POINTER_MOTION_MASK);
+        _ = c.g_signal_connect_data(self.drawing_area, "button-press-event", @ptrCast(&onButtonPress), self, null, 0);
+        _ = c.g_signal_connect_data(self.drawing_area, "button-release-event", @ptrCast(&onButtonRelease), self, null, 0);
+        _ = c.g_signal_connect_data(self.drawing_area, "motion-notify-event", @ptrCast(&onMotionNotify), self, null, 0);
 
         // Make window focusable for key events
         c.gtk_widget_set_can_focus(self.window, 1);
@@ -890,7 +963,173 @@ pub const Viewer = struct {
 
         c.cairo_restore(ctx);
     }
+
+    // Text Selection Functions
+    fn screenToPdfCoordinates(self: *Self, screen_x: f64, screen_y: f64) ?struct { page: u32, pdf_x: f64, pdf_y: f64 } {
+        // Find which page the coordinates are on
+        for (0..self.total_pages) |page_idx| {
+            const page = @as(u32, @intCast(page_idx));
+            const page_x = self.page_x_positions.items[page_idx];
+            const page_y = self.page_y_positions.items[page_idx];
+            const page_width = self.page_widths.items[page_idx] * self.scale;
+            const page_height = self.page_heights.items[page_idx] * self.scale;
+
+            if (screen_x >= page_x and screen_x <= page_x + page_width and
+                screen_y >= page_y and screen_y <= page_y + page_height) {
+                // Convert to PDF coordinates (unscaled)
+                const pdf_x = (screen_x - page_x) / self.scale;
+                const pdf_y = (screen_y - page_y) / self.scale;
+                return .{ .page = page, .pdf_x = pdf_x, .pdf_y = pdf_y };
+            }
+        }
+        return null;
+    }
+
+    fn startTextSelection(self: *Self, screen_x: f64, screen_y: f64) void {
+        if (self.screenToPdfCoordinates(screen_x, screen_y)) |coords| {
+            self.text_selection.clear();
+            self.text_selection.state = .SELECTING;
+            self.text_selection.start_page = coords.page;
+            self.text_selection.start_x = coords.pdf_x;
+            self.text_selection.start_y = coords.pdf_y;
+            self.text_selection.end_page = coords.page;
+            self.text_selection.end_x = coords.pdf_x;
+            self.text_selection.end_y = coords.pdf_y;
+            self.updateSelectionRect();
+            self.redraw();
+        }
+    }
+
+    fn updateTextSelection(self: *Self, screen_x: f64, screen_y: f64) void {
+        if (self.text_selection.state != .SELECTING) return;
+        
+        if (self.screenToPdfCoordinates(screen_x, screen_y)) |coords| {
+            self.text_selection.end_page = coords.page;
+            self.text_selection.end_x = coords.pdf_x;
+            self.text_selection.end_y = coords.pdf_y;
+            self.updateSelectionRect();
+            self.redraw();
+        }
+    }
+
+    fn finishTextSelection(self: *Self) void {
+        if (self.text_selection.state == .SELECTING) {
+            self.text_selection.state = .SELECTED;
+            self.extractSelectedText();
+            self.redraw();
+        }
+    }
+
+    fn updateSelectionRect(self: *Self) void {
+        // Create selection rectangle from start and end coordinates
+        const min_x = @min(self.text_selection.start_x, self.text_selection.end_x);
+        const max_x = @max(self.text_selection.start_x, self.text_selection.end_x);
+        const min_y = @min(self.text_selection.start_y, self.text_selection.end_y);
+        const max_y = @max(self.text_selection.start_y, self.text_selection.end_y);
+        
+        self.text_selection.selection_rect = backend_mod.TextRect{
+            .x1 = min_x,
+            .y1 = min_y,
+            .x2 = max_x,
+            .y2 = max_y,
+        };
+    }
+
+    fn extractSelectedText(self: *Self) void {
+        // Extract text from the selected area
+        const page = self.text_selection.start_page; // For now, assume single-page selection
+        const text = self.backend.getTextForArea(self.allocator, page, self.text_selection.selection_rect) catch {
+            std.debug.print("Failed to extract selected text\n", .{});
+            return;
+        };
+        
+        // Free previous selection
+        self.text_selection.deinit();
+        self.text_selection.selected_text = text;
+        
+        std.debug.print("Selected text: {s}\n", .{text});
+    }
+
+    fn drawTextSelection(self: *Self, ctx: *c.cairo_t) void {
+        if (self.text_selection.state == .NONE) return;
+        
+        const page = self.text_selection.start_page;
+        if (page >= self.total_pages) return;
+        
+        // Get page position and scale
+        const page_x = self.page_x_positions.items[page];
+        const page_y = self.page_y_positions.items[page];
+        
+        // Save context
+        c.cairo_save(ctx);
+        
+        // Translate to page position
+        c.cairo_translate(ctx, page_x, page_y);
+        
+        // Set selection highlight color
+        const bg_color = backend_mod.HighlightColor{ .r = 0.3, .g = 0.6, .b = 1.0, .a = 0.3 };
+        const glyph_color = backend_mod.HighlightColor{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 1.0 };
+        
+        // Render selection using backend
+        self.backend.renderTextSelection(page, ctx, self.scale, self.text_selection.selection_rect, glyph_color, bg_color) catch |err| {
+            std.debug.print("Error rendering text selection: {}\n", .{err});
+        };
+        
+        // Restore context
+        c.cairo_restore(ctx);
+    }
 };
+
+const GdkEventButton = extern struct {
+    type: GdkEventType,
+    window: ?*anyopaque,
+    send_event: i8,
+    time: u32,
+    x: f64,
+    y: f64,
+    axes: ?*anyopaque,
+    state: u32,
+    button: u32,
+    device: ?*anyopaque,
+    x_root: f64,
+    y_root: f64,
+};
+
+fn onButtonPress(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
+    const viewer: *Viewer = @ptrCast(@alignCast(user_data));
+    const button_event: *GdkEventButton = @ptrCast(@alignCast(event.?));
+    
+    // Handle left mouse button for text selection
+    if (button_event.button == 1) { // Left button
+        viewer.startTextSelection(button_event.x, button_event.y);
+        return 1; // Event handled
+    }
+    
+    return 0; // Event not handled
+}
+
+fn onButtonRelease(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
+    const viewer: *Viewer = @ptrCast(@alignCast(user_data));
+    const button_event: *GdkEventButton = @ptrCast(@alignCast(event.?));
+    
+    // Handle left mouse button release
+    if (button_event.button == 1) { // Left button
+        viewer.finishTextSelection();
+        return 1; // Event handled
+    }
+    
+    return 0; // Event not handled
+}
+
+fn onMotionNotify(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
+    const viewer: *Viewer = @ptrCast(@alignCast(user_data));
+    const motion_event: *GdkEventButton = @ptrCast(@alignCast(event.?)); // Reuse button struct as it has x,y
+    
+    // Update text selection if we're currently selecting
+    viewer.updateTextSelection(motion_event.x, motion_event.y);
+    
+    return 0; // Let other handlers process this event too
+}
 
 fn onDestroy(_: *c.GtkWidget, _: ?*anyopaque) callconv(.C) void {
     c.gtk_main_quit();
@@ -1152,6 +1391,9 @@ fn onDraw(_: *c.GtkWidget, ctx: *c.cairo_t, user_data: ?*anyopaque) callconv(.C)
         // Restore the transform
         c.cairo_restore(ctx);
     }
+
+    // Draw text selection if active
+    viewer.drawTextSelection(ctx);
 
     // Draw status bar at the bottom of the viewport (like Zathura) - only once, outside the page loop
     viewer.drawStatusBar(ctx);

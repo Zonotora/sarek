@@ -58,6 +58,7 @@ src/
 - Poppler development libraries
 - Cairo development libraries
 
+
 ### Arch Linux
 ```bash
 sudo pacman -S gtk3 poppler-glib cairo
@@ -91,3 +92,8 @@ Or after building:
 - Poppler: https://poppler.freedesktop.org/api/glib/
 - Gtk3: https://docs.gtk.org/gtk3/
 - Cairo: https://www.cairographics.org/documentation/
+
+## TODO
+- Performance issues with PDF with many pages. (TOC navigation as well as page navigation)
+- Fix fit to page/width.
+- Fix issues of last page when fit to page/width mode.
