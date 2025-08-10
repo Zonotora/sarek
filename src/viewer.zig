@@ -42,6 +42,9 @@ pub const Viewer = struct {
     backend: backend_mod.Backend,
     keybindings: keybindings.KeyBindings,
 
+    // File info
+    filename: []u8,
+    
     width: f64,
     height: f64,
 
@@ -88,13 +91,19 @@ pub const Viewer = struct {
         var page_y_positions = std.ArrayList(f64).init(allocator);
         var page_x_positions = std.ArrayList(f64).init(allocator);
 
+        // Extract filename from path
+        const filename = std.fs.path.basename(pdf_path);
+        const filename_copy = try allocator.dupe(u8, filename);
+
         // Pre-calculate page dimensions for layout
         for (0..total_pages) |i| {
             const page_info = backend_interface.getPageInfo(@intCast(i)) catch {
+                row_max_heights.deinit();
                 page_heights.deinit();
                 page_widths.deinit();
                 page_y_positions.deinit();
                 page_x_positions.deinit();
+                allocator.free(filename_copy);
                 allocator.destroy(backend_impl);
                 return error.InvalidPdf;
             };
@@ -110,6 +119,7 @@ pub const Viewer = struct {
             .backend_impl = backend_impl,
             .backend = backend_interface,
             .keybindings = keybindings.KeyBindings.init(allocator),
+            .filename = filename_copy,
             .width = WINDOW_WIDTH,
             .height = WINDOW_HEIGHT,
             .current_page = 0,
@@ -133,6 +143,7 @@ pub const Viewer = struct {
     pub fn deinit(self: *Self) void {
         self.backend.deinit();
         self.keybindings.deinit();
+        self.allocator.free(self.filename);
         self.row_max_heights.deinit();
         self.page_heights.deinit();
         self.page_widths.deinit();
@@ -176,7 +187,9 @@ pub const Viewer = struct {
         _ = c.g_signal_connect_data(self.drawing_area, "draw", @ptrCast(&onDraw), self, null, 0);
         _ = c.g_signal_connect_data(self.window, "configure-event", @ptrCast(&onWindowResize), self, null, 0);
 
-        // _ = c.g_signal_connect_data(self.window, "scroll_event", @ptrCast(&onScroll), self, null, 0);
+        // Add scroll event handling to force redraw on mouse wheel scroll
+        c.gtk_widget_add_events(self.drawing_area, c.GDK_SCROLL_MASK);
+        _ = c.g_signal_connect_data(self.drawing_area, "scroll-event", @ptrCast(&onScroll), self, null, 0);
 
         // Add key event handling
         c.gtk_widget_add_events(self.window, c.GDK_KEY_PRESS_MASK);
@@ -199,18 +212,22 @@ pub const Viewer = struct {
                 self.current_page += self.pages_per_row;
                 if (self.current_page >= self.total_pages) self.current_page = self.total_pages - 1;
                 self.scrollToPage(self.current_page);
+                self.redraw();
             },
             .prev_page => {
                 self.current_page = if (self.pages_per_row > self.current_page) 0 else self.current_page - self.pages_per_row;
                 self.scrollToPage(self.current_page);
+                self.redraw();
             },
             .first_page => {
                 self.current_page = 0;
                 self.scrollToPage(self.current_page);
+                self.redraw();
             },
             .last_page => {
                 self.current_page = self.total_pages - 1;
                 self.scrollToPage(self.current_page);
+                self.redraw();
             },
             .zoom_in => {
                 self.fit_mode = .NONE; // Disable fit mode when manually zooming
@@ -558,6 +575,62 @@ pub const Viewer = struct {
         }
         // std.debug.print("Zoom fit width: scale = {d:.2}\n", .{self.scale});
     }
+
+    fn drawStatusBar(self: *Self, ctx: *c.cairo_t) void {
+        // Get the current scroll position and viewport size
+        var scroll_top: f64 = 0;
+        var viewport_height: f64 = self.height;
+        
+        if (self.scrolled_window) |scrolled| {
+            const vadjustment = c.gtk_scrolled_window_get_vadjustment(@ptrCast(scrolled));
+            if (vadjustment) |vadj| {
+                scroll_top = c.gtk_adjustment_get_value(vadj);
+                viewport_height = c.gtk_adjustment_get_page_size(vadj);
+            }
+        }
+        
+        // Set up status bar styling
+        const status_bar_height: f64 = 20.0;
+        const margin: f64 = 5.0;
+        const font_size: f64 = 12.0;
+        
+        // Calculate status bar position relative to the current viewport
+        const status_bar_y = scroll_top + viewport_height - status_bar_height;
+        
+        // Clear the status bar area first with the background color
+        c.cairo_save(ctx);
+        c.cairo_set_source_rgb(ctx, 0.9, 0.9, 0.9); // Same as main background
+        c.cairo_rectangle(ctx, 0, status_bar_y, self.width, status_bar_height);
+        c.cairo_fill(ctx);
+        
+        // Draw status bar background (semi-transparent dark background)
+        c.cairo_set_source_rgba(ctx, 0.2, 0.2, 0.2, 0.8);
+        c.cairo_rectangle(ctx, 0, status_bar_y, self.width, status_bar_height);
+        c.cairo_fill(ctx);
+        
+        // Set up text properties
+        c.cairo_set_source_rgb(ctx, 1.0, 1.0, 1.0); // White text
+        c.cairo_select_font_face(ctx, "sans-serif", c.CAIRO_FONT_SLANT_NORMAL, c.CAIRO_FONT_WEIGHT_NORMAL);
+        c.cairo_set_font_size(ctx, font_size);
+        
+        // Draw filename in bottom left (viewport-relative position)
+        c.cairo_move_to(ctx, margin, status_bar_y + status_bar_height - margin);
+        c.cairo_show_text(ctx, self.filename.ptr);
+        
+        // Create and draw page info in bottom right (like Zathura: "page/total")
+        var page_info_buf: [64]u8 = undefined;
+        const page_info_str = std.fmt.bufPrintZ(page_info_buf[0..], "{}/{}", .{ self.current_page + 1, self.total_pages }) catch "?/?";
+        
+        // Get text width to position it at the right edge
+        var text_extents: c.cairo_text_extents_t = undefined;
+        c.cairo_text_extents(ctx, page_info_str.ptr, &text_extents);
+        const text_width = text_extents.width;
+        
+        c.cairo_move_to(ctx, self.width - text_width - margin, status_bar_y + status_bar_height - margin);
+        c.cairo_show_text(ctx, page_info_str.ptr);
+        
+        c.cairo_restore(ctx);
+    }
 };
 
 fn onDestroy(_: *c.GtkWidget, _: ?*anyopaque) callconv(.C) void {
@@ -741,13 +814,32 @@ const GdkEventScroll = extern struct {
 };
 
 fn onScroll(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
-    _ = user_data;
+    const viewer: *Viewer = @ptrCast(@alignCast(user_data));
+    _ = event;
 
-    const gdk_event: *GdkEventScroll = @ptrCast(@alignCast(event.?));
-    std.debug.print("{}\n", .{gdk_event});
+    // Update current_page based on the visible page range after scrolling
+    // We need to delay this slightly to let GTK update the scroll position first
+    _ = c.g_idle_add(@ptrCast(&updateCurrentPageFromScroll), user_data);
 
-    // std.debug.print("scroll", .{});
-    return 1;
+    // Force a complete redraw to ensure status bar is properly positioned
+    viewer.redraw();
+
+    return 0; // Let GTK handle the actual scrolling
+}
+
+fn updateCurrentPageFromScroll(user_data: ?*anyopaque) callconv(.C) c.gboolean {
+    const viewer: *Viewer = @ptrCast(@alignCast(user_data));
+    
+    // Get the currently visible page range
+    const visible_range = viewer.getVisiblePageRange();
+    
+    // Update current_page to the first visible page
+    viewer.current_page = visible_range.first;
+    
+    // Trigger another redraw to update the status bar with the new page number
+    viewer.redraw();
+    
+    return 0; // Don't repeat this idle callback
 }
 
 fn onDraw(_: *c.GtkWidget, ctx: *c.cairo_t, user_data: ?*anyopaque) callconv(.C) c.gboolean {
@@ -800,21 +892,10 @@ fn onDraw(_: *c.GtkWidget, ctx: *c.cairo_t, user_data: ?*anyopaque) callconv(.C)
 
         // Restore the transform
         c.cairo_restore(ctx);
-
-        // Add page number label
-        c.cairo_save(ctx);
-        c.cairo_set_source_rgb(ctx, 0.3, 0.3, 0.3);
-        c.cairo_select_font_face(ctx, "sans-serif", c.CAIRO_FONT_SLANT_NORMAL, c.CAIRO_FONT_WEIGHT_NORMAL);
-        c.cairo_set_font_size(ctx, 12.0);
-
-        // Create page number string
-        var page_num_buf: [32]u8 = undefined;
-        const page_num_str = std.fmt.bufPrintZ(page_num_buf[0..], "Page {}", .{page + 1}) catch "Page ?";
-
-        c.cairo_move_to(ctx, page_x, page_y + page_height + 25);
-        c.cairo_show_text(ctx, page_num_str.ptr);
-        c.cairo_restore(ctx);
     }
+
+    // Draw status bar at the bottom of the viewport (like Zathura) - only once, outside the page loop
+    viewer.drawStatusBar(ctx);
 
     return 0;
 }
