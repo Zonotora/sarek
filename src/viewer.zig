@@ -42,6 +42,9 @@ pub const Viewer = struct {
     backend: backend_mod.Backend,
     keybindings: keybindings.KeyBindings,
 
+    width: f64,
+    height: f64,
+
     // State
     current_page: u32,
     total_pages: u32,
@@ -107,6 +110,8 @@ pub const Viewer = struct {
             .backend_impl = backend_impl,
             .backend = backend_interface,
             .keybindings = keybindings.KeyBindings.init(allocator),
+            .width = WINDOW_WIDTH,
+            .height = WINDOW_HEIGHT,
             .current_page = 0,
             .total_pages = total_pages,
             .scale = 1.0,
@@ -323,7 +328,7 @@ pub const Viewer = struct {
             const page_height = self.page_heights.items[i] * self.scale;
             const page_x_offset = (row_max_width - page_width) / 2;
             const page_y_offset = (self.row_max_heights.items[row] - page_height) / 2;
-            std.debug.print("i={} {d:.2} {d:.2}\n", .{ i, self.row_max_heights.items[row], page_height });
+            // std.debug.print("i={} {d:.2} {d:.2}\n", .{ i, self.row_max_heights.items[row], page_height });
 
             if (col == 0) {
                 // First page in row - reset X and calculate Y
@@ -504,11 +509,10 @@ pub const Viewer = struct {
         self.fit_mode = .FIT_PAGE;
 
         const page_info = self.backend.getPageInfo(self.current_page) catch return;
-        const viewport = self.getViewportSize();
 
         // TODO: Not sure we should take y-margins into account
-        const available_width = viewport.width - (MARGIN_LEFT + MARGIN_RIGHT);
-        const available_height = viewport.height; // - (MARGIN_TOP + MARGIN_BOTTOM);
+        const available_width = self.width - (MARGIN_LEFT + MARGIN_RIGHT);
+        const available_height = self.height; // - (MARGIN_TOP + MARGIN_BOTTOM);
 
         if (available_width <= 0 or available_height <= 0) return;
 
@@ -528,9 +532,8 @@ pub const Viewer = struct {
         self.fit_mode = .FIT_WIDTH; // Set fit mode
 
         const page_info = self.backend.getPageInfo(self.current_page) catch return;
-        const viewport = self.getViewportSize();
 
-        const available_width = viewport.width - (MARGIN_LEFT + MARGIN_RIGHT);
+        const available_width = self.width - (MARGIN_LEFT + MARGIN_RIGHT);
 
         if (available_width <= 0) return;
 
@@ -577,7 +580,10 @@ fn onWindowResize(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) c
     const gdk_event: *GdkEventConfigure = @ptrCast(@alignCast(event.?));
 
     // Debug output to see resize events
-    std.debug.print("Window resized to {}x{}\n", .{ gdk_event.width, gdk_event.height });
+    // std.debug.print("Window resized to {}x{}\n", .{ gdk_event.width, gdk_event.height });
+
+    viewer.width = @as(f64, @floatFromInt(gdk_event.width));
+    viewer.height = @as(f64, @floatFromInt(gdk_event.height));
 
     viewer.updateDrawingAreaSize();
     viewer.redraw();
