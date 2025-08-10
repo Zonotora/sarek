@@ -71,6 +71,10 @@ pub const KeyBindings = struct {
         // TOC navigation
         try self.bindings.append(.{ .key = 65289, .modifiers = 0, .command = .toggle_toc }); // Tab
         try self.bindings.append(.{ .key = 65293, .modifiers = 0, .command = .toc_select }); // Enter (when in TOC mode)
+        
+        // Highlighting
+        try self.bindings.append(.{ .key = 'H', .modifiers = SHIFT_MASK, .command = .save_highlight }); // Shift+H
+        try self.bindings.append(.{ .key = 'c', .modifiers = 0, .command = .clear_selection }); // 'c' to clear selection
 
         // Layout controls - shift-modified characters need shift modifier
         try self.bindings.append(.{ .key = '>', .modifiers = SHIFT_MASK, .command = .increase_pages_per_row });

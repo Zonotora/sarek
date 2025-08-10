@@ -86,6 +86,8 @@ pub const Backend = struct {
         get_text_layout: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, page: u32, layout: *TextLayout) PdfError!void,
         get_text_for_area: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, page: u32, area: TextRect) PdfError![]u8,
         render_text_selection: *const fn (ptr: *anyopaque, page: u32, cairo_ctx: *anyopaque, scale: f64, selection: TextRect, glyph_color: HighlightColor, bg_color: HighlightColor) PdfError!void,
+        create_highlight_annotation: *const fn (ptr: *anyopaque, page: u32, selection: TextRect, color: HighlightColor, text: []const u8) PdfError!void,
+        save_document: *const fn (ptr: *anyopaque, path: []const u8) PdfError!void,
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
@@ -123,6 +125,14 @@ pub const Backend = struct {
 
     pub fn renderTextSelection(self: Self, page: u32, cairo_ctx: *anyopaque, scale: f64, selection: TextRect, glyph_color: HighlightColor, bg_color: HighlightColor) PdfError!void {
         return self.vtable.render_text_selection(self.ptr, page, cairo_ctx, scale, selection, glyph_color, bg_color);
+    }
+
+    pub fn createHighlightAnnotation(self: Self, page: u32, selection: TextRect, color: HighlightColor, text: []const u8) PdfError!void {
+        return self.vtable.create_highlight_annotation(self.ptr, page, selection, color, text);
+    }
+
+    pub fn saveDocument(self: Self, path: []const u8) PdfError!void {
+        return self.vtable.save_document(self.ptr, path);
     }
 
     pub fn deinit(self: Self) void {

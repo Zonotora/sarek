@@ -38,6 +38,10 @@ pub const Command = enum {
     toc_down,
     toc_select,
     
+    // Highlighting
+    save_highlight,
+    clear_selection,
+    
     // Search
     search_forward,
     search_backward,
@@ -71,6 +75,8 @@ pub const Command = enum {
             .{ "toc-up", .toc_up },
             .{ "toc-down", .toc_down },
             .{ "toc-select", .toc_select },
+            .{ "save-highlight", .save_highlight },
+            .{ "clear-selection", .clear_selection },
             .{ "search-forward", .search_forward },
             .{ "search-backward", .search_backward },
             .{ "search-next", .search_next },

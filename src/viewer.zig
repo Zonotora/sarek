@@ -61,7 +61,7 @@ const TextSelectionInfo = struct {
     selection_rect: backend_mod.TextRect,
     selected_text: []u8,
     allocator: ?std.mem.Allocator,
-    
+
     pub fn init() TextSelectionInfo {
         return TextSelectionInfo{
             .state = .NONE,
@@ -76,7 +76,7 @@ const TextSelectionInfo = struct {
             .allocator = null,
         };
     }
-    
+
     pub fn deinit(self: *TextSelectionInfo) void {
         if (self.allocator) |allocator| {
             if (self.selected_text.len > 0) {
@@ -85,7 +85,7 @@ const TextSelectionInfo = struct {
             }
         }
     }
-    
+
     pub fn clear(self: *TextSelectionInfo) void {
         self.deinit();
         self.state = .NONE;
@@ -101,7 +101,8 @@ pub const Viewer = struct {
     keybindings: keybindings.KeyBindings,
 
     // File info
-    filename: []u8,
+    filename: []u8, // Just the basename for display
+    full_path: []u8, // Full path for saving
 
     width: f64,
     height: f64,
@@ -158,7 +159,8 @@ pub const Viewer = struct {
         var page_y_positions = std.ArrayList(f64).init(allocator);
         var page_x_positions = std.ArrayList(f64).init(allocator);
 
-        // Extract filename from path
+        // Store both full path and filename
+        const full_path_copy = try std.fs.cwd().realpathAlloc(allocator, pdf_path);
         const filename = std.fs.path.basename(pdf_path);
         const filename_copy = try allocator.dupe(u8, filename);
 
@@ -171,6 +173,7 @@ pub const Viewer = struct {
                 page_y_positions.deinit();
                 page_x_positions.deinit();
                 allocator.free(filename_copy);
+                allocator.free(full_path_copy);
                 allocator.destroy(backend_impl);
                 return error.InvalidPdf;
             };
@@ -187,6 +190,7 @@ pub const Viewer = struct {
             .backend = backend_interface,
             .keybindings = keybindings.KeyBindings.init(allocator),
             .filename = filename_copy,
+            .full_path = full_path_copy,
             .width = WINDOW_WIDTH,
             .height = WINDOW_HEIGHT,
             .current_page = 0,
@@ -220,6 +224,7 @@ pub const Viewer = struct {
         self.backend.deinit();
         self.keybindings.deinit();
         self.allocator.free(self.filename);
+        self.allocator.free(self.full_path);
 
         // Clean up TOC entries
         for (self.toc_entries.items) |*entry| {
@@ -434,6 +439,12 @@ pub const Viewer = struct {
                 if (self.toc_mode == .VISIBLE) {
                     self.tocSelect();
                 }
+            },
+            .save_highlight => {
+                self.saveCurrentHighlight();
+            },
+            .clear_selection => {
+                self.clearTextSelection();
             },
             else => {
                 // TODO: Implement remaining commands
@@ -753,7 +764,7 @@ pub const Viewer = struct {
 
         // Draw filename in bottom left (viewport-relative position)
         c.cairo_move_to(ctx, margin, status_bar_y + status_bar_height - margin);
-        c.cairo_show_text(ctx, self.filename.ptr);
+        c.cairo_show_text(ctx, self.full_path.ptr);
 
         // Create and draw page info in bottom right (like Zathura: "page/total")
         var page_info_buf: [64]u8 = undefined;
@@ -975,13 +986,18 @@ pub const Viewer = struct {
             const page_height = self.page_heights.items[page_idx] * self.scale;
 
             if (screen_x >= page_x and screen_x <= page_x + page_width and
-                screen_y >= page_y and screen_y <= page_y + page_height) {
+                screen_y >= page_y and screen_y <= page_y + page_height)
+            {
                 // Convert to PDF coordinates (unscaled)
                 const pdf_x = (screen_x - page_x) / self.scale;
                 const pdf_y = (screen_y - page_y) / self.scale;
+
+                std.debug.print("Screen coords ({},{}) on page {} -> PDF coords ({},{}) (scale={})\n", .{ screen_x, screen_y, page, pdf_x, pdf_y, self.scale });
+
                 return .{ .page = page, .pdf_x = pdf_x, .pdf_y = pdf_y };
             }
         }
+        std.debug.print("Screen coords ({},{}) not on any page\n", .{ screen_x, screen_y });
         return null;
     }
 
@@ -1002,7 +1018,7 @@ pub const Viewer = struct {
 
     fn updateTextSelection(self: *Self, screen_x: f64, screen_y: f64) void {
         if (self.text_selection.state != .SELECTING) return;
-        
+
         if (self.screenToPdfCoordinates(screen_x, screen_y)) |coords| {
             self.text_selection.end_page = coords.page;
             self.text_selection.end_x = coords.pdf_x;
@@ -1026,7 +1042,7 @@ pub const Viewer = struct {
         const max_x = @max(self.text_selection.start_x, self.text_selection.end_x);
         const min_y = @min(self.text_selection.start_y, self.text_selection.end_y);
         const max_y = @max(self.text_selection.start_y, self.text_selection.end_y);
-        
+
         self.text_selection.selection_rect = backend_mod.TextRect{
             .x1 = min_x,
             .y1 = min_y,
@@ -1038,45 +1054,124 @@ pub const Viewer = struct {
     fn extractSelectedText(self: *Self) void {
         // Extract text from the selected area
         const page = self.text_selection.start_page; // For now, assume single-page selection
+
+        std.debug.print("Extracting text from page {} at rect: ({},{}) to ({},{})\n", .{ page, self.text_selection.selection_rect.x1, self.text_selection.selection_rect.y1, self.text_selection.selection_rect.x2, self.text_selection.selection_rect.y2 });
+
         const text = self.backend.getTextForArea(self.allocator, page, self.text_selection.selection_rect) catch {
             std.debug.print("Failed to extract selected text\n", .{});
             return;
         };
-        
+
         // Free previous selection
         self.text_selection.deinit();
         self.text_selection.selected_text = text;
-        
-        std.debug.print("Selected text: {s}\n", .{text});
+
+        std.debug.print("Selected text: '{s}' (length: {})\n", .{ text, text.len });
     }
 
     fn drawTextSelection(self: *Self, ctx: *c.cairo_t) void {
         if (self.text_selection.state == .NONE) return;
-        
+
         const page = self.text_selection.start_page;
         if (page >= self.total_pages) return;
-        
+
         // Get page position and scale
         const page_x = self.page_x_positions.items[page];
         const page_y = self.page_y_positions.items[page];
-        
+
         // Save context
         c.cairo_save(ctx);
-        
+
         // Translate to page position
         c.cairo_translate(ctx, page_x, page_y);
-        
+
         // Set selection highlight color
         const bg_color = backend_mod.HighlightColor{ .r = 0.3, .g = 0.6, .b = 1.0, .a = 0.3 };
         const glyph_color = backend_mod.HighlightColor{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 1.0 };
-        
+
         // Render selection using backend
         self.backend.renderTextSelection(page, ctx, self.scale, self.text_selection.selection_rect, glyph_color, bg_color) catch |err| {
             std.debug.print("Error rendering text selection: {}\n", .{err});
         };
-        
+
         // Restore context
         c.cairo_restore(ctx);
+    }
+
+    fn saveCurrentHighlight(self: *Self) void {
+        if (self.text_selection.state != .SELECTED) {
+            std.debug.print("No text selected to highlight\n", .{});
+            return;
+        }
+
+        std.debug.print("Saving highlight:\n", .{});
+        std.debug.print("  Original file: {s}\n", .{self.full_path});
+        std.debug.print("  Selected text: '{s}'\n", .{self.text_selection.selected_text});
+        std.debug.print("  Page: {}, Rect: ({},{}) to ({},{})\n", .{ self.text_selection.start_page, self.text_selection.selection_rect.x1, self.text_selection.selection_rect.y1, self.text_selection.selection_rect.x2, self.text_selection.selection_rect.y2 });
+
+        // Use yellow as default highlight color
+        const highlight_color = backend_mod.HighlightColor{ .r = 1.0, .g = 1.0, .b = 0.0, .a = 0.6 };
+
+        // Create the annotation
+        const page = self.text_selection.start_page;
+        self.backend.createHighlightAnnotation(page, self.text_selection.selection_rect, highlight_color, self.text_selection.selected_text) catch |err| {
+            std.debug.print("Failed to create highlight annotation: {}\n", .{err});
+            return;
+        };
+
+        // Create a new filename for the annotated version
+        var output_path = std.ArrayList(u8).init(self.allocator);
+        defer output_path.deinit();
+
+        // Check if full_path already has "_annotated" suffix
+        const annotated_suffix = "_annotated.pdf";
+        if (std.mem.endsWith(u8, self.full_path, annotated_suffix)) {
+            // Already has suffix, just overwrite
+            output_path.appendSlice(self.full_path) catch {
+                std.debug.print("Out of memory creating output path\n", .{});
+                return;
+            };
+        } else if (std.mem.endsWith(u8, self.full_path, ".pdf")) {
+            // Remove .pdf and add _annotated.pdf
+            const base_name = self.full_path[0 .. self.full_path.len - 4];
+            output_path.appendSlice(base_name) catch {
+                std.debug.print("Out of memory creating output path\n", .{});
+                return;
+            };
+            output_path.appendSlice(annotated_suffix) catch {
+                std.debug.print("Out of memory creating output path\n", .{});
+                return;
+            };
+        } else {
+            // No .pdf extension, just add suffix
+            output_path.appendSlice(self.full_path) catch {
+                std.debug.print("Out of memory creating output path\n", .{});
+                return;
+            };
+            output_path.appendSlice("_annotated.pdf") catch {
+                std.debug.print("Out of memory creating output path\n", .{});
+                return;
+            };
+        }
+
+        // Save the document with the new annotation
+        self.backend.saveDocument(output_path.items) catch |err| {
+            std.debug.print("Failed to save document to {s}: {}\n", .{ output_path.items, err });
+            return;
+        };
+
+        std.debug.print("Highlight saved to: {s}\n", .{output_path.items});
+
+        std.debug.print("Highlight saved to PDF!\n", .{});
+
+        // Clear the current selection
+        self.clearTextSelection();
+    }
+
+    fn clearTextSelection(self: *Self) void {
+        self.text_selection.clear();
+        self.redraw();
+        std.debug.print("Text selection cleared\n", .{});
     }
 };
 
@@ -1098,36 +1193,36 @@ const GdkEventButton = extern struct {
 fn onButtonPress(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
     const viewer: *Viewer = @ptrCast(@alignCast(user_data));
     const button_event: *GdkEventButton = @ptrCast(@alignCast(event.?));
-    
+
     // Handle left mouse button for text selection
     if (button_event.button == 1) { // Left button
         viewer.startTextSelection(button_event.x, button_event.y);
         return 1; // Event handled
     }
-    
+
     return 0; // Event not handled
 }
 
 fn onButtonRelease(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
     const viewer: *Viewer = @ptrCast(@alignCast(user_data));
     const button_event: *GdkEventButton = @ptrCast(@alignCast(event.?));
-    
+
     // Handle left mouse button release
     if (button_event.button == 1) { // Left button
         viewer.finishTextSelection();
         return 1; // Event handled
     }
-    
+
     return 0; // Event not handled
 }
 
 fn onMotionNotify(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
     const viewer: *Viewer = @ptrCast(@alignCast(user_data));
     const motion_event: *GdkEventButton = @ptrCast(@alignCast(event.?)); // Reuse button struct as it has x,y
-    
+
     // Update text selection if we're currently selecting
     viewer.updateTextSelection(motion_event.x, motion_event.y);
-    
+
     return 0; // Let other handlers process this event too
 }
 

@@ -40,6 +40,8 @@ pub const PopplerBackend = struct {
                 .get_text_layout = getTextLayout,
                 .get_text_for_area = getTextForArea,
                 .render_text_selection = renderTextSelection,
+                .create_highlight_annotation = createHighlightAnnotation,
+                .save_document = saveDocument,
                 .deinit = deinit,
             },
         };
@@ -211,7 +213,7 @@ pub const PopplerBackend = struct {
         var rectangles: ?*c.PopplerRectangle = null;
         var n_rectangles: c_uint = 0;
         const success = c.poppler_page_get_text_layout(poppler_page, &rectangles, &n_rectangles);
-        
+
         if (success == 0 or rectangles == null or n_rectangles == 0) {
             layout.rectangles = &[_]backend_mod.TextRect{};
             layout.text = &[_]u8{};
@@ -235,7 +237,7 @@ pub const PopplerBackend = struct {
 
         // Convert rectangles to our format
         const zig_rectangles = try allocator.alloc(backend_mod.TextRect, n_rectangles);
-        
+
         for (0..n_rectangles) |i| {
             const poppler_rect = @as([*]c.PopplerRectangle, @ptrCast(rectangles))[i];
             zig_rectangles[i] = backend_mod.TextRect{
@@ -279,7 +281,7 @@ pub const PopplerBackend = struct {
         const text_len = std.mem.len(text_cstr);
         const text_copy = try allocator.alloc(u8, text_len);
         @memcpy(text_copy, text_cstr[0..text_len]);
-        
+
         return text_copy;
     }
 
@@ -325,6 +327,142 @@ pub const PopplerBackend = struct {
         if (c.cairo_status(ctx) != c.CAIRO_STATUS_SUCCESS) {
             return backend_mod.PdfError.RenderError;
         }
+    }
+
+    fn createHighlightAnnotation(ptr: *anyopaque, page: u32, selection: backend_mod.TextRect, color: backend_mod.HighlightColor, text: []const u8) backend_mod.PdfError!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const doc = self.document orelse return backend_mod.PdfError.InvalidPdf;
+
+        const poppler_page = c.poppler_document_get_page(doc, @intCast(page));
+        if (poppler_page == null) {
+            return backend_mod.PdfError.PageOutOfRange;
+        }
+        defer c.g_object_unref(poppler_page);
+
+        // Get page dimensions to convert coordinates
+        var page_width: f64 = undefined;
+        var page_height: f64 = undefined;
+        c.poppler_page_get_size(poppler_page, &page_width, &page_height);
+
+        // Convert from our coordinate system to PDF coordinate system
+        // PDF coordinates have origin at bottom-left, our coordinates have origin at top-left
+        const pdf_y1 = page_height - selection.y2; // Bottom of selection in PDF coords
+        const pdf_y2 = page_height - selection.y1; // Top of selection in PDF coords
+
+        // Try using null for quadrilaterals to see if simpler approach works
+        // This will use the rectangle for highlighting instead of precise quadrilaterals
+        const quad_array: *c.GArray = c.g_array_new(0, 0, @sizeOf(c.PopplerQuadrilateral));
+
+        // TODO: FIXME: This should depend on the text selection and PDF coordinates
+        const quad1 = c.PopplerQuadrilateral{
+            .p1 = .{ .x = 0.0, .y = 0.0 },
+            .p2 = .{ .x = 1.0, .y = 1.0 },
+            .p3 = .{ .x = 2.0, .y = 2.0 },
+            .p4 = .{ .x = 3.0, .y = 3.0 },
+        };
+
+        _ = c.g_array_append_val(quad_array, quad1);
+
+        // Create bounding rectangle (in PDF coordinates)
+        var rect = c.PopplerRectangle{
+            .x1 = selection.x1,
+            .y1 = pdf_y1,
+            .x2 = selection.x2,
+            .y2 = pdf_y2,
+        };
+
+        // Create highlight annotation
+        const annotation = c.poppler_annot_text_markup_new_highlight(doc, &rect, quad_array);
+        if (annotation == null) {
+            return backend_mod.PdfError.RenderError;
+        }
+
+        // Set annotation color
+        var poppler_color = c.PopplerColor{
+            .red = @as(u16, @intFromFloat(color.r * 65535.0)),
+            .green = @as(u16, @intFromFloat(color.g * 65535.0)),
+            .blue = @as(u16, @intFromFloat(color.b * 65535.0)),
+        };
+        c.poppler_annot_set_color(annotation, &poppler_color);
+
+        // Set annotation contents (the selected text)
+        const null_terminated_text = std.heap.c_allocator.dupeZ(u8, text) catch {
+            c.g_object_unref(annotation);
+            return backend_mod.PdfError.OutOfMemory;
+        };
+        defer std.heap.c_allocator.free(null_terminated_text);
+
+        c.poppler_annot_set_contents(annotation, null_terminated_text.ptr);
+
+        // Add annotation to page
+        c.poppler_page_add_annot(poppler_page, annotation);
+
+        // Clean up annotation reference
+        c.g_object_unref(annotation);
+
+        std.debug.print("Created highlight annotation on page {}\n", .{page + 1});
+    }
+
+    fn saveDocument(ptr: *anyopaque, path: []const u8) backend_mod.PdfError!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const doc = self.document orelse return backend_mod.PdfError.InvalidPdf;
+
+        std.debug.print("Attempting to save document to: {s}\n", .{path});
+
+        // First ensure the path is absolute - if it's relative, make it absolute
+        var abs_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const abs_path = if (std.fs.path.isAbsolute(path))
+            path
+        else
+            std.fs.cwd().realpath(path, &abs_path_buf) catch |err| {
+                std.debug.print("Failed to get absolute path for {s}: {}\n", .{ path, err });
+                return backend_mod.PdfError.FileNotFound;
+            };
+
+        std.debug.print("Using absolute path: {s}\n", .{abs_path});
+
+        // Create null-terminated string for C API
+        const c_path = self.allocator.dupeZ(u8, abs_path) catch return backend_mod.PdfError.OutOfMemory;
+        defer self.allocator.free(c_path);
+
+        // Check directory access before attempting to save
+        if (std.fs.path.dirname(c_path)) |dir| {
+            std.debug.print("Checking directory: {s}\n", .{dir});
+            std.fs.cwd().access(dir, .{}) catch |err| {
+                std.debug.print("Directory access error: {}\n", .{err});
+                return backend_mod.PdfError.FileNotFound;
+            };
+        }
+
+        // Create URI from path
+        var error_ptr: ?*c.GError = null;
+        const uri = c.g_filename_to_uri(c_path.ptr, null, &error_ptr);
+        if (uri == null) {
+            std.debug.print("Failed to create URI from path: {s}\n", .{abs_path});
+            if (error_ptr) |err| {
+                std.debug.print("URI error: {s}\n", .{err.message});
+                c.g_error_free(err);
+            }
+            return backend_mod.PdfError.FileNotFound;
+        }
+        defer c.g_free(uri);
+
+        std.debug.print("Created URI: {s}\n", .{uri});
+
+        // Save document with annotations
+        const success = c.poppler_document_save(doc, uri, &error_ptr);
+        if (success == 0) {
+            std.debug.print("poppler_document_save failed\n", .{});
+            if (error_ptr) |err| {
+                std.debug.print("Save error: {s}\n", .{err.message});
+                c.g_error_free(err);
+            } else {
+                std.debug.print("No error message provided\n", .{});
+            }
+            return backend_mod.PdfError.RenderError;
+        }
+
+        std.debug.print("Successfully saved PDF with annotations to: {s}\n", .{abs_path});
     }
 
     fn deinit(ptr: *anyopaque) void {
