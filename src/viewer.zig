@@ -466,9 +466,11 @@ pub const Viewer = struct {
         for (0..self.total_pages) |i| {
             const page = @as(u32, @intCast(i));
             const row = page / self.pages_per_row;
+            const last_page = i == self.total_pages - 1;
 
-            if (row != last_row) {
-                self.row_max_heights.items[row - 1] = row_height;
+            if (row != last_row or i == self.total_pages - 1) {
+                const index = if (last_page) row else row - 1;
+                self.row_max_heights.items[index] = row_height;
                 total_width = @max(total_width, row_width);
 
                 row_width = 0;
@@ -484,6 +486,8 @@ pub const Viewer = struct {
         row_height = 0;
 
         const row_max_width = total_width / @as(f64, @floatFromInt(self.pages_per_row));
+        const window_x_offset = @max(0, self.width - total_width) / 2;
+        // std.debug.print("row_max_height={}", .{row_max_width});
 
         for (0..self.total_pages) |i| {
             const page = @as(u32, @intCast(i));
@@ -503,6 +507,8 @@ pub const Viewer = struct {
                     current_y += row_height + self.page_spacing;
                 }
                 row_height = 0; // Reset for new row
+
+                current_x += window_x_offset;
             }
 
             // Add top margin if first page
@@ -674,17 +680,26 @@ pub const Viewer = struct {
 
         self.fit_mode = .FIT_PAGE;
 
-        const page_info = self.backend.getPageInfo(self.current_page) catch return;
+        const index = self.current_page / self.pages_per_row;
+        const end = index + self.pages_per_row;
 
-        // TODO: Not sure we should take y-margins into account
+        var width: f64 = 0;
+        var height: f64 = 0;
+
+        for (index..end) |page_num| {
+            const page_info = self.backend.getPageInfo(@intCast(page_num)) catch return;
+            width += page_info.width;
+            height = @max(height, page_info.height);
+        }
+
         const available_width = self.width - (MARGIN_LEFT + MARGIN_RIGHT);
-        const available_height = self.height; // - (MARGIN_TOP + MARGIN_BOTTOM);
+        const available_height = self.height - (MARGIN_TOP + MARGIN_BOTTOM);
 
         if (available_width <= 0 or available_height <= 0) return;
 
         // Calculate scale to fit both width and height
-        const width_scale = available_width / page_info.width;
-        const height_scale = available_height / page_info.height;
+        const width_scale = available_width / width;
+        const height_scale = available_height / height;
 
         // Use the smaller scale to ensure the entire page fits
         self.scale = @max(0.1, @min(5.0, @min(width_scale, height_scale)));
@@ -768,7 +783,7 @@ pub const Viewer = struct {
 
         // Create and draw page info in bottom right (like Zathura: "page/total")
         var page_info_buf: [64]u8 = undefined;
-        const page_info_str = std.fmt.bufPrintZ(page_info_buf[0..], "{}/{}", .{ self.current_page + 1, self.total_pages }) catch "?/?";
+        const page_info_str = std.fmt.bufPrintZ(page_info_buf[0..], "[{}/{}]", .{ self.current_page + 1, self.total_pages }) catch "?/?";
 
         // Get text width to position it at the right edge
         var text_extents: c.cairo_text_extents_t = undefined;
@@ -1110,7 +1125,7 @@ pub const Viewer = struct {
         std.debug.print("  Page: {}, Rect: ({},{}) to ({},{})\n", .{ self.text_selection.start_page, self.text_selection.selection_rect.x1, self.text_selection.selection_rect.y1, self.text_selection.selection_rect.x2, self.text_selection.selection_rect.y2 });
 
         // Use yellow as default highlight color
-        const highlight_color = backend_mod.HighlightColor{ .r = 1.0, .g = 1.0, .b = 0.0, .a = 0.6 };
+        const highlight_color = backend_mod.HighlightColor{ .r = 1.0, .g = 1.0, .b = 0.596, .a = 0.6 };
 
         // Create the annotation
         const page = self.text_selection.start_page;
