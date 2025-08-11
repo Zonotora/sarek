@@ -97,3 +97,7 @@ Or after building:
 - Performance issues with PDF with many pages. (TOC navigation as well as page navigation)
 - Fix fit to page/width.
 - Fix issues of last page when fit to page/width mode.
+
+
+## Explore
+- Find order of points to make a quadrilateral

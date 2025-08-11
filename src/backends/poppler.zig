@@ -344,31 +344,139 @@ pub const PopplerBackend = struct {
         var page_height: f64 = undefined;
         c.poppler_page_get_size(poppler_page, &page_width, &page_height);
 
-        // Convert from our coordinate system to PDF coordinate system
-        // PDF coordinates have origin at bottom-left, our coordinates have origin at top-left
-        const pdf_y1 = page_height - selection.y2; // Bottom of selection in PDF coords
-        const pdf_y2 = page_height - selection.y1; // Top of selection in PDF coords
+        // Get text layout for this page to create proper quadrilaterals
+        var rectangles: ?*c.PopplerRectangle = null;
+        var n_rectangles: c_uint = 0;
+        const success = c.poppler_page_get_text_layout(poppler_page, &rectangles, &n_rectangles);
 
-        // Try using null for quadrilaterals to see if simpler approach works
-        // This will use the rectangle for highlighting instead of precise quadrilaterals
+        if (success == 0 or rectangles == null or n_rectangles == 0) {
+            // Fallback to simple rectangle if no text layout available
+            return createSimpleHighlight(doc, poppler_page, selection, color, text, page_height);
+        }
+        defer c.g_free(rectangles);
+
+        // Create quadrilateral array for the highlight annotation
         const quad_array: *c.GArray = c.g_array_new(0, 0, @sizeOf(c.PopplerQuadrilateral));
+        defer _ = c.g_array_free(quad_array, 1);
 
-        // TODO: FIXME: This should depend on the text selection and PDF coordinates
-        const quad1 = c.PopplerQuadrilateral{
-            .p1 = .{ .x = 0.0, .y = 0.0 },
-            .p2 = .{ .x = 1.0, .y = 1.0 },
-            .p3 = .{ .x = 2.0, .y = 2.0 },
-            .p4 = .{ .x = 3.0, .y = 3.0 },
-        };
+        // Group all character rectangles by line first
+        var lines = std.ArrayList(std.ArrayList(c.PopplerRectangle)).init(self.allocator);
+        defer {
+            for (lines.items) |*line| {
+                line.deinit();
+            }
+            lines.deinit();
+        }
 
-        _ = c.g_array_append_val(quad_array, quad1);
+        const line_tolerance: f64 = 2.0; // Tolerance for grouping rectangles into lines
+
+        // Group all characters by line
+        for (0..n_rectangles) |i| {
+            const rect = @as([*]c.PopplerRectangle, @ptrCast(rectangles))[i];
+
+            // Find which line this character belongs to
+            var found_line: ?usize = null;
+            for (lines.items, 0..) |line, line_idx| {
+                if (line.items.len > 0) {
+                    const line_y = line.items[0].y1;
+                    if (@abs(rect.y1 - line_y) <= line_tolerance) {
+                        found_line = line_idx;
+                        break;
+                    }
+                }
+            }
+
+            if (found_line) |line_idx| {
+                try lines.items[line_idx].append(rect);
+            } else {
+                // Create new line
+                var new_line = std.ArrayList(c.PopplerRectangle).init(self.allocator);
+                try new_line.append(rect);
+                try lines.append(new_line);
+            }
+        }
+
+        // Sort lines by Y coordinate (top to bottom)
+        std.sort.insertion(@TypeOf(lines.items[0]), lines.items, {}, struct {
+            fn lessThan(_: void, a: std.ArrayList(c.PopplerRectangle), b: std.ArrayList(c.PopplerRectangle)) bool {
+                if (a.items.len == 0) return true;
+                if (b.items.len == 0) return false;
+                return a.items[0].y1 < b.items[0].y1;
+            }
+        }.lessThan);
+
+        // Find which lines are affected by the selection
+        var affected_lines = std.ArrayList(usize).init(self.allocator);
+        defer affected_lines.deinit();
+
+        for (lines.items, 0..) |line, line_idx| {
+            if (line.items.len == 0) continue;
+
+            const line_y1 = line.items[0].y1;
+            const line_y2 = line.items[0].y2;
+
+            // Check if this line intersects with selection Y range
+            if (line_y2 >= selection.y1 and line_y1 <= selection.y2) {
+                try affected_lines.append(line_idx);
+            }
+        }
+
+        // Process each affected line
+        var min_x: f64 = std.math.inf(f64);
+        var max_x: f64 = -std.math.inf(f64);
+        var min_y: f64 = std.math.inf(f64);
+        var max_y: f64 = -std.math.inf(f64);
+
+        for (affected_lines.items, 0..) |line_idx, affected_idx| {
+            const line = lines.items[line_idx];
+            if (line.items.len == 0) continue;
+
+            // Sort characters in line by X coordinate
+            const line_chars = try self.allocator.dupe(c.PopplerRectangle, line.items);
+            defer self.allocator.free(line_chars);
+            std.sort.insertion(c.PopplerRectangle, line_chars, {}, struct {
+                fn lessThan(_: void, a: c.PopplerRectangle, b: c.PopplerRectangle) bool {
+                    return a.x1 < b.x1;
+                }
+            }.lessThan);
+
+            var line_min_x: f64 = line_chars[0].x1;
+            var line_max_x: f64 = line_chars[line_chars.len - 1].x2;
+            const line_min_y: f64 = line_chars[0].y1;
+            const line_max_y: f64 = line_chars[0].y2;
+
+            // Adjust line bounds based on selection type
+            if (affected_lines.items.len == 1) {
+                // Single line selection - use selection bounds
+                line_min_x = @max(line_min_x, selection.x1);
+                line_max_x = @min(line_max_x, selection.x2);
+            } else if (affected_idx == 0) {
+                // First line - from selection start to end of line
+                line_min_x = @max(line_min_x, selection.x1);
+            } else if (affected_idx == affected_lines.items.len - 1) {
+                // Last line - from beginning of line to selection end
+                line_max_x = @min(line_max_x, selection.x2);
+            }
+            // Middle lines use full line width (no adjustment needed)
+
+            // Update overall bounds
+            min_x = @min(min_x, line_min_x);
+            max_x = @max(max_x, line_max_x);
+            min_y = @min(min_y, line_min_y);
+            max_y = @max(max_y, line_max_y);
+
+            // Create quadrilateral for this line
+            try addQuadrilateralForLineBounds(line_min_x, line_max_x, line_min_y, line_max_y, quad_array, page_height);
+        }
 
         // Create bounding rectangle (in PDF coordinates)
+        const pdf_min_y = page_height - max_y;
+        const pdf_max_y = page_height - min_y;
         var rect = c.PopplerRectangle{
-            .x1 = selection.x1,
-            .y1 = pdf_y1,
-            .x2 = selection.x2,
-            .y2 = pdf_y2,
+            .x1 = min_x,
+            .y1 = pdf_min_y,
+            .x2 = max_x,
+            .y2 = pdf_max_y,
         };
 
         // Create highlight annotation
@@ -397,10 +505,75 @@ pub const PopplerBackend = struct {
         // Add annotation to page
         c.poppler_page_add_annot(poppler_page, annotation);
 
-        // Clean up annotation reference
+        // Clean up resources
         c.g_object_unref(annotation);
 
         std.debug.print("Created highlight annotation on page {}\n", .{page + 1});
+    }
+
+    fn addQuadrilateralForLineBounds(min_x: f64, max_x: f64, min_y: f64, max_y: f64, quad_array: *c.GArray, page_height: f64) !void {
+        // Convert to PDF coordinates (flip Y axis)
+        const pdf_min_y = page_height - max_y;
+        const pdf_max_y = page_height - min_y;
+
+        // Create quadrilateral for this line
+        // Points must be in counter-clockwise order starting from bottom-left in PDF coordinates
+        const quad = c.PopplerQuadrilateral{
+            .p1 = .{ .x = min_x, .y = pdf_min_y }, // bottom-left
+            .p2 = .{ .x = min_x, .y = pdf_max_y }, // top-left
+            .p3 = .{ .x = max_x, .y = pdf_min_y }, // bottom-right
+            .p4 = .{ .x = max_x, .y = pdf_max_y }, // top-right
+        };
+
+        _ = c.g_array_append_val(quad_array, quad);
+    }
+
+    // TODO: Properly check edge-cases
+    fn createSimpleHighlight(doc: ?*c.PopplerDocument, poppler_page: ?*c.PopplerPage, selection: backend_mod.TextRect, color: backend_mod.HighlightColor, text: []const u8, page_height: f64) backend_mod.PdfError!void {
+        // Fallback implementation using simple rectangle
+        const quad_array: *c.GArray = c.g_array_new(0, 0, @sizeOf(c.PopplerQuadrilateral));
+        defer _ = c.g_array_free(quad_array, 1);
+
+        const pdf_y1 = page_height - selection.y2;
+        const pdf_y2 = page_height - selection.y1;
+
+        const quad = c.PopplerQuadrilateral{
+            .p1 = .{ .x = selection.x1, .y = pdf_y1 }, // bottom-left
+            .p2 = .{ .x = selection.x1, .y = pdf_y2 }, // top-left
+            .p3 = .{ .x = selection.x2, .y = pdf_y2 }, // top-right
+            .p4 = .{ .x = selection.x2, .y = pdf_y1 }, // bottom-right
+        };
+
+        _ = c.g_array_append_val(quad_array, quad);
+
+        var rect = c.PopplerRectangle{
+            .x1 = selection.x1,
+            .y1 = pdf_y1,
+            .x2 = selection.x2,
+            .y2 = pdf_y2,
+        };
+
+        const annotation = c.poppler_annot_text_markup_new_highlight(doc, &rect, quad_array);
+        if (annotation == null) {
+            return backend_mod.PdfError.RenderError;
+        }
+
+        var poppler_color = c.PopplerColor{
+            .red = @as(u16, @intFromFloat(color.r * 65535.0)),
+            .green = @as(u16, @intFromFloat(color.g * 65535.0)),
+            .blue = @as(u16, @intFromFloat(color.b * 65535.0)),
+        };
+        c.poppler_annot_set_color(annotation, &poppler_color);
+
+        const null_terminated_text = std.heap.c_allocator.dupeZ(u8, text) catch {
+            c.g_object_unref(annotation);
+            return backend_mod.PdfError.OutOfMemory;
+        };
+        defer std.heap.c_allocator.free(null_terminated_text);
+
+        c.poppler_annot_set_contents(annotation, null_terminated_text.ptr);
+        c.poppler_page_add_annot(poppler_page, annotation);
+        c.g_object_unref(annotation);
     }
 
     fn saveDocument(ptr: *anyopaque, path: []const u8) backend_mod.PdfError!void {
