@@ -1411,7 +1411,7 @@ const GdkEventScroll = extern struct {
     time: u32,
     x: f64,
     y: f64,
-    state: ?*anyopaque, // if the pointer can be null; else without '?'
+    state: u32, // if the pointer can be null; else without '?'
     direction: c.GdkScrollDirection,
     device: ?*anyopaque,
     x_root: f64,
@@ -1423,7 +1423,24 @@ const GdkEventScroll = extern struct {
 
 fn onScroll(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
     const viewer: *Viewer = @ptrCast(@alignCast(user_data));
-    _ = event;
+
+    const gdk_event: *GdkEventScroll = @ptrCast(@alignCast(event.?));
+    const ctrl_pressed = (gdk_event.state & c.GDK_CONTROL_MASK) != 0;
+
+    if (ctrl_pressed) {
+        switch (gdk_event.direction) {
+            c.GDK_SCROLL_UP => viewer.executeCommand(.zoom_in),
+            c.GDK_SCROLL_DOWN => viewer.executeCommand(.zoom_out),
+            c.GDK_SCROLL_SMOOTH => {
+                if (gdk_event.delta_y >= 0) {
+                    viewer.executeCommand(.zoom_in);
+                } else {
+                    viewer.executeCommand(.zoom_out);
+                }
+            },
+            else => {},
+        }
+    }
 
     // Update current_page based on the visible page range after scrolling
     // We need to delay this slightly to let GTK update the scroll position first
