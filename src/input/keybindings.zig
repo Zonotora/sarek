@@ -67,11 +67,11 @@ pub const KeyBindings = struct {
         try self.bindings.append(.{ .key = 'r', .modifiers = 0, .command = .refresh });
         try self.bindings.append(.{ .key = 'F', .modifiers = SHIFT_MASK, .command = .toggle_fullscreen });
         try self.bindings.append(.{ .key = 65307, .modifiers = 0, .command = .quit }); // Escape
-        
+
         // TOC navigation
         try self.bindings.append(.{ .key = 65289, .modifiers = 0, .command = .toggle_toc }); // Tab
         try self.bindings.append(.{ .key = 65293, .modifiers = 0, .command = .toc_select }); // Enter (when in TOC mode)
-        
+
         // Highlighting
         try self.bindings.append(.{ .key = 'H', .modifiers = SHIFT_MASK, .command = .save_highlight }); // Shift+H
         try self.bindings.append(.{ .key = 'c', .modifiers = 0, .command = .clear_selection }); // 'c' to clear selection

@@ -3,6 +3,7 @@ const backend_mod = @import("backends/backend.zig");
 const poppler = @import("backends/poppler.zig");
 const keybindings = @import("input/keybindings.zig");
 const commands = @import("input/commands.zig");
+const Command = @import("input/commands.zig").Command;
 
 const c = @cImport({
     @cInclude("gtk/gtk.h");
@@ -37,6 +38,11 @@ const Dimension = struct { width: f64, height: f64 };
 const TocMode = enum {
     HIDDEN,
     VISIBLE,
+};
+
+const CommandMode = enum {
+    NORMAL,
+    COMMAND,
 };
 
 const TocDirection = enum {
@@ -134,6 +140,11 @@ pub const Viewer = struct {
     page_y_positions: std.ArrayList(f64), // Y positions for each page (row-based)
     page_x_positions: std.ArrayList(f64), // X positions for each page
 
+    // Command line mode state
+    command_mode: CommandMode,
+    command_buffer: std.ArrayList(u8),
+    command_cursor: usize,
+
     // GTK widgets
     window: ?*c.GtkWidget,
     drawing_area: ?*c.GtkWidget,
@@ -214,6 +225,9 @@ pub const Viewer = struct {
             .page_widths = page_widths,
             .page_y_positions = page_y_positions,
             .page_x_positions = page_x_positions,
+            .command_mode = .NORMAL,
+            .command_buffer = std.ArrayList(u8).init(allocator),
+            .command_cursor = 0,
             .window = null,
             .drawing_area = null,
             .scrolled_window = null,
@@ -246,6 +260,7 @@ pub const Viewer = struct {
         self.page_widths.deinit();
         self.page_y_positions.deinit();
         self.page_x_positions.deinit();
+        self.command_buffer.deinit();
         self.allocator.destroy(self.backend_impl);
     }
 
@@ -445,6 +460,15 @@ pub const Viewer = struct {
             },
             .clear_selection => {
                 self.clearTextSelection();
+            },
+            .open_file => {
+                // TODO: Fix me
+            },
+            .write_file => {
+                // TODO: Fix me
+            },
+            .save_as => {
+                // TODO: Fix me
             },
             else => {
                 // TODO: Implement remaining commands
@@ -777,10 +801,16 @@ pub const Viewer = struct {
         c.cairo_select_font_face(ctx, "sans-serif", c.CAIRO_FONT_SLANT_NORMAL, c.CAIRO_FONT_WEIGHT_NORMAL);
         c.cairo_set_font_size(ctx, font_size);
 
-        // Draw filename in bottom left (viewport-relative position)
-        c.cairo_move_to(ctx, margin, status_bar_y + status_bar_height - margin);
-        c.cairo_show_text(ctx, self.full_path.ptr);
+        if (self.command_mode == .COMMAND) {
+            self.drawCommandLine(ctx, status_bar_y, status_bar_height, margin);
+        } else {
+            self.drawStatusBarInfo(ctx, status_bar_y, status_bar_height, margin);
+        }
 
+        c.cairo_restore(ctx);
+    }
+
+    fn drawStatusBarPageNumber(self: *Self, ctx: *c.cairo_t, y: f64, height: f64, margin: f64) void {
         // Create and draw page info in bottom right (like Zathura: "page/total")
         var page_info_buf: [64]u8 = undefined;
         const page_info_str = std.fmt.bufPrintZ(page_info_buf[0..], "[{}/{}]", .{ self.current_page + 1, self.total_pages }) catch "?/?";
@@ -790,10 +820,60 @@ pub const Viewer = struct {
         c.cairo_text_extents(ctx, page_info_str.ptr, &text_extents);
         const text_width = text_extents.width;
 
-        c.cairo_move_to(ctx, self.width - text_width - margin, status_bar_y + status_bar_height - margin);
+        c.cairo_move_to(ctx, self.width - text_width - margin, y + height - margin);
         c.cairo_show_text(ctx, page_info_str.ptr);
+    }
 
-        c.cairo_restore(ctx);
+    fn drawStatusBarInfo(self: *Self, ctx: *c.cairo_t, y: f64, height: f64, margin: f64) void {
+        // Draw normal status bar
+
+        // Draw filename in bottom left (viewport-relative position)
+        c.cairo_move_to(ctx, margin, y + height - margin);
+        c.cairo_show_text(ctx, self.full_path.ptr);
+
+        self.drawStatusBarPageNumber(ctx, y, height, margin);
+    }
+
+    fn drawCommandLine(self: *Self, ctx: *c.cairo_t, y: f64, height: f64, margin: f64) void {
+        // Draw command prompt ":"
+        c.cairo_move_to(ctx, margin, y + height - margin);
+        c.cairo_show_text(ctx, ":");
+
+        // Get the width of the colon to position the command text
+        var colon_extents: c.cairo_text_extents_t = undefined;
+        c.cairo_text_extents(ctx, ":", &colon_extents);
+        const colon_width = colon_extents.width;
+
+        // Draw command text
+        const command_x = margin + colon_width + 2; // 2px space after colon
+        c.cairo_move_to(ctx, command_x, y + height - margin);
+
+        // Convert command buffer to null-terminated string for Cairo
+        var text_buf: [512]u8 = undefined;
+        const command_len = @min(self.command_buffer.items.len, text_buf.len - 1);
+        @memcpy(text_buf[0..command_len], self.command_buffer.items[0..command_len]);
+        text_buf[command_len] = 0; // null terminate
+
+        c.cairo_show_text(ctx, text_buf[0..command_len :0].ptr);
+
+        // Draw cursor
+        if (self.command_cursor <= self.command_buffer.items.len) {
+            const cursor_pos = @min(self.command_cursor, text_buf.len - 1);
+            text_buf[cursor_pos] = 0;
+
+            // Get text width up to cursor position
+            var cursor_extents: c.cairo_text_extents_t = undefined;
+            c.cairo_text_extents(ctx, text_buf[0..cursor_pos :0].ptr, &cursor_extents);
+            const cursor_x = command_x + cursor_extents.width;
+
+            // Draw cursor as a vertical line
+            c.cairo_set_line_width(ctx, 1.0);
+            c.cairo_move_to(ctx, cursor_x, y + 2);
+            c.cairo_line_to(ctx, cursor_x, y + height - 2);
+            c.cairo_stroke(ctx);
+        }
+
+        self.drawStatusBarPageNumber(ctx, y, height, margin);
     }
 
     fn toggleToc(self: *Self) void {
@@ -1188,6 +1268,110 @@ pub const Viewer = struct {
         self.redraw();
         std.debug.print("Text selection cleared\n", .{});
     }
+
+    // Command mode functions
+    fn enterCommandMode(self: *Self) void {
+        self.command_mode = .COMMAND;
+        self.command_buffer.clearRetainingCapacity();
+        self.command_cursor = 0;
+        self.redraw();
+        std.debug.print("Entered command mode\n", .{});
+    }
+
+    fn exitCommandMode(self: *Self) void {
+        self.command_mode = .NORMAL;
+        self.command_buffer.clearRetainingCapacity();
+        self.command_cursor = 0;
+        self.redraw();
+        std.debug.print("Exited command mode\n", .{});
+    }
+
+    fn handleCommandModeInput(self: *Self, keyval: u32, modifiers: u32) bool {
+        _ = modifiers; // suppress unused parameter warning
+
+        // TODO: Need to properly map keybindings to keycodes
+        switch (keyval) {
+            27 => { // Escape
+                self.exitCommandMode();
+                return true;
+            },
+            65293 => { // Enter/Return
+                self.executeCommandLine();
+                return true;
+            },
+            65288 => { // Backspace
+                if (self.command_buffer.items.len > 0 and self.command_cursor > 0) {
+                    _ = self.command_buffer.orderedRemove(self.command_cursor - 1);
+                    self.command_cursor -= 1;
+                    self.redraw();
+                }
+                return true;
+            },
+            65361 => { // Left arrow
+                if (self.command_cursor > 0) {
+                    self.command_cursor -= 1;
+                    self.redraw();
+                }
+                return true;
+            },
+            65363 => { // Right arrow
+                if (self.command_cursor < self.command_buffer.items.len) {
+                    self.command_cursor += 1;
+                    self.redraw();
+                }
+                return true;
+            },
+            else => {
+                // Handle printable characters
+                if (keyval >= 32 and keyval <= 126) { // ASCII printable range
+                    const char: u8 = @intCast(keyval);
+                    self.command_buffer.insert(self.command_cursor, char) catch return true;
+                    self.command_cursor += 1;
+                    self.redraw();
+                    return true;
+                }
+                return false;
+            },
+        }
+    }
+
+    fn executeCommandLine(self: *Self) void {
+        const command_text = self.command_buffer.items;
+        std.debug.print("Executing command: '{s}'\n", .{command_text});
+
+        if (command_text.len == 0) {
+            self.exitCommandMode();
+            return;
+        }
+
+        var parts = std.mem.splitScalar(u8, command_text, ' ');
+        // TODO: Support multiple parts
+        const command_name = parts.next() orelse {
+            self.exitCommandMode();
+            return;
+        };
+
+        // Handle numeric commands (goto page)
+        // if (std.fmt.parseInt(u32, command_name, 10)) |page_num| {
+        //     if (page_num > 0 and page_num <= self.total_pages) {
+        //         self.current_page = page_num - 1;
+        //         self.scrollToPage(self.current_page);
+        //         self.redraw();
+        //     }
+        //     self.exitCommandMode();
+        //     return;
+        // } else |_| {}
+
+        // Try to parse as a regular command
+        if (Command.fromString(command_name)) |command| {
+            self.executeCommand(command);
+            self.exitCommandMode();
+            return;
+        }
+
+        std.debug.print("Unknown command: '{s}'\n", .{command_name});
+        self.exitCommandMode();
+    }
 };
 
 const GdkEventButton = extern struct {
@@ -1391,7 +1575,18 @@ fn onKeyPress(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callc
     const modifiers = gdk_event.state;
 
     // Debug output
-    std.debug.print("keyval={} modifiers={} hardware_keycode={}\n", .{ keyval, modifiers, gdk_event.hardware_keycode });
+    std.debug.print("keyval={} modifiers={} hardware_keycode={} mode={}\n", .{ keyval, modifiers, gdk_event.hardware_keycode, viewer.command_mode });
+
+    // Handle command mode input
+    if (viewer.command_mode == .COMMAND) {
+        return if (viewer.handleCommandModeInput(keyval, modifiers)) 1 else 0;
+    }
+
+    // Handle colon key to enter command mode
+    if (keyval == ':') {
+        viewer.enterCommandMode();
+        return 1;
+    }
 
     // Look up command using the keybinding system
     if (viewer.keybindings.getCommand(keyval, modifiers)) |command| {

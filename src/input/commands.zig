@@ -48,8 +48,13 @@ pub const Command = enum {
     search_next,
     search_prev,
     
+    // File operations
+    open_file,
+    write_file,
+    save_as,
+    
     pub fn fromString(str: []const u8) ?Command {
-        const map = std.ComptimeStringMap(Command, .{
+        const map = std.StaticStringMap(Command).initComptime(.{
             .{ "next-page", .next_page },
             .{ "prev-page", .prev_page },
             .{ "first-page", .first_page },
@@ -81,6 +86,12 @@ pub const Command = enum {
             .{ "search-backward", .search_backward },
             .{ "search-next", .search_next },
             .{ "search-prev", .search_prev },
+            .{ "open", .open_file },
+            .{ "write", .write_file },
+            .{ "w", .write_file },
+            .{ "save-as", .save_as },
+            .{ "q", .quit },
+            .{ "quit", .quit },
         });
         
         return map.get(str);
