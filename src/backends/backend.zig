@@ -85,6 +85,8 @@ pub const Backend = struct {
         extract_toc: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, toc_entries: *std.ArrayList(TocEntry)) PdfError!void,
         get_text_layout: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, page: u32, layout: *TextLayout) PdfError!void,
         get_text_for_area: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, page: u32, area: TextRect) PdfError![]u8,
+        get_text_for_page: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, page: u32) PdfError![]u8,
+        get_character_rect: *const fn (ptr: *anyopaque, page: u32, char_index: u32) PdfError!TextRect,
         render_text_selection: *const fn (ptr: *anyopaque, page: u32, cairo_ctx: *anyopaque, scale: f64, selection: TextRect, glyph_color: HighlightColor, bg_color: HighlightColor) PdfError!void,
         create_highlight_annotation: *const fn (ptr: *anyopaque, page: u32, selection: TextRect, color: HighlightColor, text: []const u8) PdfError!void,
         save_document: *const fn (ptr: *anyopaque, path: []const u8) PdfError!void,
@@ -121,6 +123,14 @@ pub const Backend = struct {
 
     pub fn getTextForArea(self: Self, allocator: std.mem.Allocator, page: u32, area: TextRect) PdfError![]u8 {
         return self.vtable.get_text_for_area(self.ptr, allocator, page, area);
+    }
+
+    pub fn getTextForPage(self: Self, allocator: std.mem.Allocator, page: u32) PdfError![]u8 {
+        return self.vtable.get_text_for_page(self.ptr, allocator, page);
+    }
+
+    pub fn getCharacterRect(self: Self, page: u32, char_index: u32) PdfError!TextRect {
+        return self.vtable.get_character_rect(self.ptr, page, char_index);
     }
 
     pub fn renderTextSelection(self: Self, page: u32, cairo_ctx: *anyopaque, scale: f64, selection: TextRect, glyph_color: HighlightColor, bg_color: HighlightColor) PdfError!void {

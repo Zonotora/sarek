@@ -53,6 +53,27 @@ pub const Command = enum {
     write_file,
     save_as,
     
+    // Vim cursor motions
+    cursor_char_find,      // f<char> - find next char
+    cursor_char_find_back, // F<char> - find previous char
+    cursor_char_till,      // t<char> - till next char
+    cursor_char_till_back, // T<char> - till previous char
+    cursor_word_next,      // w - next word
+    cursor_word_back,      // b - previous word
+    cursor_word_end,       // e - end of word
+    cursor_line_start,     // 0 - start of line
+    cursor_line_end,       // $ - end of line
+    cursor_repeat_find,    // ; - repeat last find
+    cursor_repeat_find_back, // , - repeat last find backwards
+
+    // Visual mode and hjkl navigation
+    enter_visual_mode,     // v - enter visual mode
+    exit_visual_mode,      // escape from visual mode
+    cursor_left,           // h - move left
+    cursor_down,           // j - move down
+    cursor_up,             // k - move up
+    cursor_right,          // l - move right
+    
     pub fn fromString(str: []const u8) ?Command {
         const map = std.StaticStringMap(Command).initComptime(.{
             .{ "next-page", .next_page },

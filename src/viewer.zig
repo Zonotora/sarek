@@ -45,6 +45,30 @@ const CommandMode = enum {
     COMMAND,
 };
 
+const VisualMode = enum {
+    NONE,
+    VISUAL,      // Character-wise visual selection
+    VISUAL_LINE, // Line-wise visual selection (for future)
+};
+
+const TextCursor = struct {
+    page: u32,
+    char_index: u32,  // Character index within the page
+    x: f64,          // Screen X position
+    y: f64,          // Screen Y position
+    visible: bool,
+
+    pub fn init() TextCursor {
+        return TextCursor{
+            .page = 0,
+            .char_index = 0,
+            .x = 0,
+            .y = 0,
+            .visible = true,
+        };
+    }
+};
+
 const TocDirection = enum {
     UP,
     DOWN,
@@ -145,6 +169,18 @@ pub const Viewer = struct {
     command_buffer: std.ArrayList(u8),
     command_cursor: usize,
 
+    // Text cursor for vim-like navigation
+    text_cursor: TextCursor,
+    find_char: ?u8,        // Last character searched for with f/F
+    find_direction: i8,    // 1 for forward, -1 for backward
+    find_mode: ?commands.Command, // Current find mode (f, F, t, T) waiting for character
+    page_text_cache: std.AutoHashMap(u32, []u8), // Cache of extracted text per page
+
+    // Visual mode state
+    visual_mode: VisualMode,
+    visual_start_cursor: TextCursor, // Starting position of visual selection
+    visual_selection_rect: backend_mod.TextRect, // Current visual selection rectangle
+
     // GTK widgets
     window: ?*c.GtkWidget,
     drawing_area: ?*c.GtkWidget,
@@ -228,6 +264,14 @@ pub const Viewer = struct {
             .command_mode = .NORMAL,
             .command_buffer = std.ArrayList(u8).init(allocator),
             .command_cursor = 0,
+            .text_cursor = TextCursor.init(),
+            .find_char = null,
+            .find_direction = 1,
+            .find_mode = null,
+            .page_text_cache = std.AutoHashMap(u32, []u8).init(allocator),
+            .visual_mode = .NONE,
+            .visual_start_cursor = TextCursor.init(),
+            .visual_selection_rect = backend_mod.TextRect{ .x1 = 0, .y1 = 0, .x2 = 0, .y2 = 0 },
             .window = null,
             .drawing_area = null,
             .scrolled_window = null,
@@ -261,6 +305,14 @@ pub const Viewer = struct {
         self.page_y_positions.deinit();
         self.page_x_positions.deinit();
         self.command_buffer.deinit();
+        
+        // Clean up text cache
+        var iterator = self.page_text_cache.iterator();
+        while (iterator.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.page_text_cache.deinit();
+        
         self.allocator.destroy(self.backend_impl);
     }
 
@@ -317,6 +369,9 @@ pub const Viewer = struct {
         c.gtk_widget_set_can_focus(self.window, 1);
         c.gtk_widget_grab_focus(self.window);
 
+        // Initialize text cursor
+        self.initializeCursor();
+
         // Show all widgets
         c.gtk_widget_show_all(self.window);
 
@@ -350,21 +405,25 @@ pub const Viewer = struct {
             .next_page => {
                 self.current_page += self.pages_per_row;
                 if (self.current_page >= self.total_pages) self.current_page = self.total_pages - 1;
+                self.moveCursorToPage(self.current_page);
                 self.scrollToPage(self.current_page);
                 self.redraw();
             },
             .prev_page => {
                 self.current_page = if (self.pages_per_row > self.current_page) 0 else self.current_page - self.pages_per_row;
+                self.moveCursorToPage(self.current_page);
                 self.scrollToPage(self.current_page);
                 self.redraw();
             },
             .first_page => {
                 self.current_page = 0;
+                self.moveCursorToPage(self.current_page);
                 self.scrollToPage(self.current_page);
                 self.redraw();
             },
             .last_page => {
                 self.current_page = self.total_pages - 1;
+                self.moveCursorToPage(self.current_page);
                 self.scrollToPage(self.current_page);
                 self.redraw();
             },
@@ -372,28 +431,33 @@ pub const Viewer = struct {
                 self.fit_mode = .NONE; // Disable fit mode when manually zooming
                 self.scale = @min(self.scale * 1.2, 5.0);
                 self.updateDrawingAreaSize();
+                self.updateCursorPosition();
                 self.redraw();
             },
             .zoom_out => {
                 self.fit_mode = .NONE; // Disable fit mode when manually zooming
                 self.scale = @max(self.scale / 1.2, 0.1);
                 self.updateDrawingAreaSize();
+                self.updateCursorPosition();
                 self.redraw();
             },
             .zoom_original => {
                 self.fit_mode = .NONE; // Disable fit mode when manually zooming
                 self.scale = 1.0;
                 self.updateDrawingAreaSize();
+                self.updateCursorPosition();
                 self.redraw();
             },
             .zoom_fit_page => {
                 self.zoomFitPage();
                 self.updateDrawingAreaSize();
+                self.updateCursorPosition();
                 self.redraw();
             },
             .zoom_fit_width => {
                 self.zoomFitWidth();
                 self.updateDrawingAreaSize();
+                self.updateCursorPosition();
                 self.redraw();
             },
             .quit => {
@@ -469,6 +533,76 @@ pub const Viewer = struct {
             },
             .save_as => {
                 // TODO: Fix me
+            },
+            .cursor_word_next => {
+                self.moveCursorWordNext();
+                if (self.visual_mode != .NONE) self.updateVisualSelection();
+                self.redraw();
+            },
+            .cursor_word_back => {
+                self.moveCursorWordBack();
+                if (self.visual_mode != .NONE) self.updateVisualSelection();
+                self.redraw();
+            },
+            .cursor_word_end => {
+                self.moveCursorWordEnd();
+                if (self.visual_mode != .NONE) self.updateVisualSelection();
+                self.redraw();
+            },
+            .cursor_line_start => {
+                self.moveCursorLineStart();
+                if (self.visual_mode != .NONE) self.updateVisualSelection();
+                self.redraw();
+            },
+            .cursor_line_end => {
+                self.moveCursorLineEnd();
+                if (self.visual_mode != .NONE) self.updateVisualSelection();
+                self.redraw();
+            },
+            .cursor_repeat_find => {
+                if (self.find_char) |char| {
+                    _ = self.moveCursorToChar(char, self.find_direction == 1);
+                    if (self.visual_mode != .NONE) self.updateVisualSelection();
+                    self.redraw();
+                }
+            },
+            .cursor_repeat_find_back => {
+                if (self.find_char) |char| {
+                    _ = self.moveCursorToChar(char, self.find_direction == -1);
+                    if (self.visual_mode != .NONE) self.updateVisualSelection();
+                    self.redraw();
+                }
+            },
+            .cursor_char_find, .cursor_char_find_back, .cursor_char_till, .cursor_char_till_back => {
+                // These commands need a character input, set find mode
+                self.find_mode = command;
+                std.debug.print("Waiting for character input for command: {}\n", .{command});
+            },
+            .enter_visual_mode => {
+                self.enterVisualMode();
+            },
+            .exit_visual_mode => {
+                self.exitVisualMode();
+            },
+            .cursor_left => {
+                self.moveCursorLeft();
+                if (self.visual_mode != .NONE) self.updateVisualSelection();
+                self.redraw();
+            },
+            .cursor_right => {
+                self.moveCursorRight();
+                if (self.visual_mode != .NONE) self.updateVisualSelection();
+                self.redraw();
+            },
+            .cursor_up => {
+                self.moveCursorUp();
+                if (self.visual_mode != .NONE) self.updateVisualSelection();
+                self.redraw();
+            },
+            .cursor_down => {
+                self.moveCursorDown();
+                if (self.visual_mode != .NONE) self.updateVisualSelection();
+                self.redraw();
             },
             else => {
                 // TODO: Implement remaining commands
@@ -1372,6 +1506,518 @@ pub const Viewer = struct {
         std.debug.print("Unknown command: '{s}'\n", .{command_name});
         self.exitCommandMode();
     }
+
+    // Text cursor functions
+    fn getPageText(self: *Self, page: u32) ![]const u8 {
+        if (page >= self.total_pages) return &[_]u8{};
+        
+        // Check cache first
+        if (self.page_text_cache.get(page)) |cached_text| {
+            return cached_text;
+        }
+
+        // Extract text from page
+        const text = self.backend.getTextForPage(self.allocator, page) catch |err| {
+            std.debug.print("Failed to extract text from page {}: {}\n", .{ page, err });
+            return &[_]u8{};
+        };
+
+        // Cache the text
+        try self.page_text_cache.put(page, text);
+        return text;
+    }
+
+    fn initializeCursor(self: *Self) void {
+        // Position cursor at first character of first page
+        self.text_cursor.page = 0;
+        self.text_cursor.char_index = 0;
+        self.updateCursorPosition();
+        std.debug.print("Cursor initialized at page {}, char {}\n", .{ self.text_cursor.page, self.text_cursor.char_index });
+    }
+
+    fn updateCursorPosition(self: *Self) void {
+        const page_text = self.getPageText(self.text_cursor.page) catch return;
+        
+        if (page_text.len == 0 or self.text_cursor.char_index >= page_text.len) {
+            self.text_cursor.visible = false;
+            return;
+        }
+
+        // Get character position using backend
+        const char_rect = self.backend.getCharacterRect(self.text_cursor.page, self.text_cursor.char_index) catch {
+            self.text_cursor.visible = false;
+            return;
+        };
+
+        // Convert to screen coordinates
+        const page_x = self.page_x_positions.items[self.text_cursor.page];
+        const page_y = self.page_y_positions.items[self.text_cursor.page];
+        
+        self.text_cursor.x = page_x + (char_rect.x1 * self.scale);
+        self.text_cursor.y = page_y + (char_rect.y1 * self.scale);
+        self.text_cursor.visible = true;
+    }
+
+    fn moveCursorToChar(self: *Self, target_char: u8, forward: bool) bool {
+        const page_text = self.getPageText(self.text_cursor.page) catch return false;
+        
+        if (page_text.len == 0) return false;
+
+        var search_start = self.text_cursor.char_index;
+        if (forward and search_start < page_text.len - 1) {
+            search_start += 1;
+        } else if (!forward and search_start > 0) {
+            search_start -= 1;
+        } else {
+            return false;
+        }
+
+        var found_index: ?u32 = null;
+        
+        if (forward) {
+            for (search_start..page_text.len) |i| {
+                if (page_text[i] == target_char) {
+                    found_index = @intCast(i);
+                    break;
+                }
+            }
+        } else {
+            var i = search_start;
+            while (i > 0) {
+                i -= 1;
+                if (page_text[i] == target_char) {
+                    found_index = @intCast(i);
+                    break;
+                }
+            }
+        }
+
+        if (found_index) |index| {
+            self.text_cursor.char_index = index;
+            self.updateCursorPosition();
+            return true;
+        }
+
+        return false;
+    }
+
+    fn moveCursorWordNext(self: *Self) void {
+        const page_text = self.getPageText(self.text_cursor.page) catch return;
+        
+        if (page_text.len == 0) {
+            // Move to next page if current page has no text
+            self.moveCursorToNextPage();
+            return;
+        }
+        
+        if (self.text_cursor.char_index >= page_text.len) {
+            // At end of page, move to next page
+            self.moveCursorToNextPage();
+            return;
+        }
+
+        var i = self.text_cursor.char_index;
+        
+        // Skip current word
+        while (i < page_text.len and isWordChar(page_text[i])) {
+            i += 1;
+        }
+        
+        // Skip whitespace
+        while (i < page_text.len and isWhitespace(page_text[i])) {
+            i += 1;
+        }
+
+        if (i >= page_text.len) {
+            // Reached end of page, move to next page
+            self.moveCursorToNextPage();
+        } else {
+            self.text_cursor.char_index = i;
+            self.updateCursorPosition();
+        }
+    }
+
+    fn moveCursorWordBack(self: *Self) void {
+        const page_text = self.getPageText(self.text_cursor.page) catch return;
+        
+        if (page_text.len == 0) {
+            // Move to previous page if current page has no text
+            self.moveCursorToPrevPage();
+            return;
+        }
+        
+        if (self.text_cursor.char_index == 0) {
+            // At beginning of page, move to previous page
+            self.moveCursorToPrevPage();
+            return;
+        }
+
+        var i = self.text_cursor.char_index;
+        
+        // Move back one position
+        if (i > 0) i -= 1;
+        
+        // Skip whitespace
+        while (i > 0 and isWhitespace(page_text[i])) {
+            i -= 1;
+        }
+        
+        // Skip current word
+        while (i > 0 and isWordChar(page_text[i])) {
+            i -= 1;
+        }
+        
+        // Adjust to start of word if we went too far
+        if (i > 0 and !isWordChar(page_text[i])) {
+            i += 1;
+        }
+
+        self.text_cursor.char_index = i;
+        self.updateCursorPosition();
+    }
+
+    fn moveCursorWordEnd(self: *Self) void {
+        const page_text = self.getPageText(self.text_cursor.page) catch return;
+        
+        if (page_text.len == 0 or self.text_cursor.char_index >= page_text.len) return;
+
+        var i = self.text_cursor.char_index;
+        
+        // If at whitespace, skip to next word
+        if (isWhitespace(page_text[i])) {
+            while (i < page_text.len and isWhitespace(page_text[i])) {
+                i += 1;
+            }
+        }
+        
+        // Move to end of current word
+        while (i < page_text.len - 1 and isWordChar(page_text[i + 1])) {
+            i += 1;
+        }
+
+        self.text_cursor.char_index = @min(i, @as(u32, @intCast(page_text.len)) - 1);
+        self.updateCursorPosition();
+    }
+
+    fn moveCursorLineStart(self: *Self) void {
+        const page_text = self.getPageText(self.text_cursor.page) catch return;
+        
+        if (page_text.len == 0) return;
+
+        var i = self.text_cursor.char_index;
+        
+        // Find start of current line
+        while (i > 0 and page_text[i - 1] != '\n') {
+            i -= 1;
+        }
+
+        self.text_cursor.char_index = i;
+        self.updateCursorPosition();
+    }
+
+    fn moveCursorLineEnd(self: *Self) void {
+        const page_text = self.getPageText(self.text_cursor.page) catch return;
+        
+        if (page_text.len == 0) return;
+
+        var i = self.text_cursor.char_index;
+        
+        // Find end of current line
+        while (i < page_text.len and page_text[i] != '\n') {
+            i += 1;
+        }
+        
+        // Step back one if we hit a newline
+        if (i > 0 and i < page_text.len and page_text[i] == '\n') {
+            i -= 1;
+        }
+
+        self.text_cursor.char_index = @min(i, @as(u32, @intCast(page_text.len)) - 1);
+        self.updateCursorPosition();
+    }
+
+    fn moveCursorToPage(self: *Self, page: u32) void {
+        if (page >= self.total_pages) return;
+        
+        self.text_cursor.page = page;
+        self.text_cursor.char_index = 0; // Start at beginning of page
+        self.updateCursorPosition();
+    }
+
+    fn handleFindModeInput(self: *Self, char: u8) void {
+        if (self.find_mode) |mode| {
+            switch (mode) {
+                .cursor_char_find => {
+                    self.find_char = char;
+                    self.find_direction = 1;
+                    _ = self.moveCursorToChar(char, true);
+                    if (self.visual_mode != .NONE) self.updateVisualSelection();
+                    self.redraw();
+                },
+                .cursor_char_find_back => {
+                    self.find_char = char;
+                    self.find_direction = -1;
+                    _ = self.moveCursorToChar(char, false);
+                    if (self.visual_mode != .NONE) self.updateVisualSelection();
+                    self.redraw();
+                },
+                .cursor_char_till => {
+                    self.find_char = char;
+                    self.find_direction = 1;
+                    if (self.moveCursorToChar(char, true)) {
+                        // Move one position back to stop before the character
+                        if (self.text_cursor.char_index > 0) {
+                            self.text_cursor.char_index -= 1;
+                            self.updateCursorPosition();
+                        }
+                    }
+                    if (self.visual_mode != .NONE) self.updateVisualSelection();
+                    self.redraw();
+                },
+                .cursor_char_till_back => {
+                    self.find_char = char;
+                    self.find_direction = -1;
+                    if (self.moveCursorToChar(char, false)) {
+                        // Move one position forward to stop before the character
+                        const page_text = self.getPageText(self.text_cursor.page) catch return;
+                        if (self.text_cursor.char_index + 1 < page_text.len) {
+                            self.text_cursor.char_index += 1;
+                            self.updateCursorPosition();
+                        }
+                    }
+                    if (self.visual_mode != .NONE) self.updateVisualSelection();
+                    self.redraw();
+                },
+                else => {},
+            }
+            self.find_mode = null; // Clear find mode after processing
+        }
+    }
+
+    fn moveCursorToNextPage(self: *Self) void {
+        if (self.text_cursor.page + 1 < self.total_pages) {
+            self.moveCursorToPage(self.text_cursor.page + 1);
+            self.scrollToPage(self.text_cursor.page);
+            self.redraw();
+        }
+    }
+
+    fn moveCursorToPrevPage(self: *Self) void {
+        if (self.text_cursor.page > 0) {
+            const prev_page = self.text_cursor.page - 1;
+            self.text_cursor.page = prev_page;
+            
+            // Position cursor at end of previous page
+            const page_text = self.getPageText(prev_page) catch {
+                self.text_cursor.char_index = 0;
+                self.updateCursorPosition();
+                return;
+            };
+            
+            if (page_text.len > 0) {
+                self.text_cursor.char_index = @as(u32, @intCast(page_text.len)) - 1;
+            } else {
+                self.text_cursor.char_index = 0;
+            }
+            
+            self.updateCursorPosition();
+            self.scrollToPage(self.text_cursor.page);
+            self.redraw();
+        }
+    }
+    
+    // Helper functions
+    fn isWordChar(ch: u8) bool {
+        return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_';
+    }
+    
+    fn isWhitespace(ch: u8) bool {
+        return ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r';
+    }
+
+    fn drawTextCursor(self: *Self, ctx: *c.cairo_t) void {
+        if (!self.text_cursor.visible) return;
+
+        // Get current scroll position for visibility check
+        var scroll_top: f64 = 0;
+        var viewport_height: f64 = self.height;
+        
+        if (self.scrolled_window) |scrolled| {
+            const vadjustment = c.gtk_scrolled_window_get_vadjustment(@ptrCast(scrolled));
+            if (vadjustment) |vadj| {
+                scroll_top = c.gtk_adjustment_get_value(vadj);
+                viewport_height = c.gtk_adjustment_get_page_size(vadj);
+            }
+        }
+
+        // Check if cursor is in visible area
+        if (self.text_cursor.y < scroll_top or self.text_cursor.y > scroll_top + viewport_height) {
+            return;
+        }
+
+        // Save cairo state
+        c.cairo_save(ctx);
+
+        // Set cursor appearance
+        c.cairo_set_source_rgb(ctx, 1.0, 0.0, 0.0); // Red cursor
+        c.cairo_set_line_width(ctx, 2.0);
+
+        // Draw cursor as a vertical line
+        const cursor_height: f64 = 12.0; // Height of cursor line
+        c.cairo_move_to(ctx, self.text_cursor.x, self.text_cursor.y);
+        c.cairo_line_to(ctx, self.text_cursor.x, self.text_cursor.y + cursor_height);
+        c.cairo_stroke(ctx);
+
+        // Draw small cursor block at the base
+        c.cairo_rectangle(ctx, self.text_cursor.x - 2, self.text_cursor.y + cursor_height - 2, 4, 2);
+        c.cairo_fill(ctx);
+
+        // Restore cairo state
+        c.cairo_restore(ctx);
+    }
+
+    // Visual mode functions
+    fn enterVisualMode(self: *Self) void {
+        self.visual_mode = .VISUAL;
+        self.visual_start_cursor = self.text_cursor;
+        self.updateVisualSelection();
+        std.debug.print("Entered visual mode\n", .{});
+        self.redraw();
+    }
+
+    fn exitVisualMode(self: *Self) void {
+        self.visual_mode = .NONE;
+        self.visual_selection_rect = backend_mod.TextRect{ .x1 = 0, .y1 = 0, .x2 = 0, .y2 = 0 };
+        std.debug.print("Exited visual mode\n", .{});
+        self.redraw();
+    }
+
+    fn updateVisualSelection(self: *Self) void {
+        if (self.visual_mode == .NONE) return;
+
+        // Calculate selection rectangle from visual_start_cursor to current text_cursor
+        const start_rect = self.backend.getCharacterRect(self.visual_start_cursor.page, self.visual_start_cursor.char_index) catch {
+            return;
+        };
+        
+        const end_rect = self.backend.getCharacterRect(self.text_cursor.page, self.text_cursor.char_index) catch {
+            return;
+        };
+
+        // Create selection rectangle spanning from start to end
+        self.visual_selection_rect = backend_mod.TextRect{
+            .x1 = @min(start_rect.x1, end_rect.x1),
+            .y1 = @min(start_rect.y1, end_rect.y1),
+            .x2 = @max(start_rect.x2, end_rect.x2),
+            .y2 = @max(start_rect.y2, end_rect.y2),
+        };
+    }
+
+    // hjkl navigation functions
+    fn moveCursorLeft(self: *Self) void {
+        if (self.text_cursor.char_index > 0) {
+            self.text_cursor.char_index -= 1;
+            self.updateCursorPosition();
+        } else if (self.text_cursor.page > 0) {
+            // Move to end of previous page
+            self.moveCursorToPrevPage();
+        }
+    }
+
+    fn moveCursorRight(self: *Self) void {
+        const page_text = self.getPageText(self.text_cursor.page) catch return;
+        
+        if (self.text_cursor.char_index + 1 < page_text.len) {
+            self.text_cursor.char_index += 1;
+            self.updateCursorPosition();
+        } else if (self.text_cursor.page + 1 < self.total_pages) {
+            // Move to beginning of next page
+            self.moveCursorToNextPage();
+        }
+    }
+
+    fn moveCursorUp(self: *Self) void {
+        // For now, implement as moving to previous line start
+        // A more sophisticated implementation would maintain column position
+        const page_text = self.getPageText(self.text_cursor.page) catch return;
+        
+        if (page_text.len == 0) return;
+
+        var i = self.text_cursor.char_index;
+        
+        // Go to start of current line
+        while (i > 0 and page_text[i - 1] != '\n') {
+            i -= 1;
+        }
+        
+        // If we're already at line start, go to previous line
+        if (i == self.text_cursor.char_index and i > 0) {
+            i -= 1; // Step back to previous line
+            // Find start of that line
+            while (i > 0 and page_text[i - 1] != '\n') {
+                i -= 1;
+            }
+        }
+
+        self.text_cursor.char_index = i;
+        self.updateCursorPosition();
+    }
+
+    fn moveCursorDown(self: *Self) void {
+        // For now, implement as moving to next line start
+        const page_text = self.getPageText(self.text_cursor.page) catch return;
+        
+        if (page_text.len == 0) return;
+
+        var i = self.text_cursor.char_index;
+        
+        // Find end of current line
+        while (i < page_text.len and page_text[i] != '\n') {
+            i += 1;
+        }
+        
+        // Move to start of next line
+        if (i < page_text.len and page_text[i] == '\n') {
+            i += 1;
+        }
+
+        if (i >= page_text.len) {
+            // Move to next page if at end
+            self.moveCursorToNextPage();
+        } else {
+            self.text_cursor.char_index = i;
+            self.updateCursorPosition();
+        }
+    }
+
+    fn drawVisualSelection(self: *Self, ctx: *c.cairo_t) void {
+        if (self.visual_mode == .NONE) return;
+
+        // Only draw selection if we're on the same page as the selection
+        // For multi-page selections, we'd need more complex logic
+        if (self.visual_start_cursor.page != self.text_cursor.page) return;
+
+        const page_x = self.page_x_positions.items[self.text_cursor.page];
+        const page_y = self.page_y_positions.items[self.text_cursor.page];
+
+        // Save context
+        c.cairo_save(ctx);
+
+        // Translate to page position
+        c.cairo_translate(ctx, page_x, page_y);
+
+        // Set selection color (light blue with transparency)
+        const bg_color = backend_mod.HighlightColor{ .r = 0.4, .g = 0.7, .b = 1.0, .a = 0.3 };
+        const glyph_color = backend_mod.HighlightColor{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 1.0 };
+
+        // Render visual selection using backend
+        self.backend.renderTextSelection(self.text_cursor.page, ctx, self.scale, self.visual_selection_rect, glyph_color, bg_color) catch |err| {
+            std.debug.print("Error rendering visual selection: {}\n", .{err});
+        };
+
+        // Restore context
+        c.cairo_restore(ctx);
+    }
 };
 
 const GdkEventButton = extern struct {
@@ -1582,10 +2228,43 @@ fn onKeyPress(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callc
         return if (viewer.handleCommandModeInput(keyval, modifiers)) 1 else 0;
     }
 
+    // Handle find mode input (waiting for character after f/F/t/T)
+    if (viewer.find_mode != null) {
+        if (keyval >= 32 and keyval <= 126) { // ASCII printable range
+            const char: u8 = @intCast(keyval);
+            viewer.handleFindModeInput(char);
+            return 1;
+        } else if (keyval == 27) { // Escape - cancel find mode
+            viewer.find_mode = null;
+            return 1;
+        }
+        return 0;
+    }
+
+    // Handle escape key
+    if (keyval == 27) { // Escape
+        if (viewer.visual_mode != .NONE) {
+            viewer.exitVisualMode();
+            return 1;
+        }
+    }
+
     // Handle colon key to enter command mode
     if (keyval == ':') {
         viewer.enterCommandMode();
         return 1;
+    }
+
+    // Handle j/k keys differently in visual mode vs normal mode
+    if (viewer.visual_mode != .NONE) {
+        // In visual mode, j/k should move cursor up/down
+        if (keyval == 'j') {
+            viewer.executeCommand(.cursor_down);
+            return 1;
+        } else if (keyval == 'k') {
+            viewer.executeCommand(.cursor_up);
+            return 1;
+        }
     }
 
     // Look up command using the keybinding system
@@ -1716,6 +2395,12 @@ fn onDraw(_: *c.GtkWidget, ctx: *c.cairo_t, user_data: ?*anyopaque) callconv(.C)
 
     // Draw text selection if active
     viewer.drawTextSelection(ctx);
+
+    // Draw visual selection if in visual mode
+    viewer.drawVisualSelection(ctx);
+
+    // Draw text cursor
+    viewer.drawTextCursor(ctx);
 
     // Draw status bar at the bottom of the viewport (like Zathura) - only once, outside the page loop
     viewer.drawStatusBar(ctx);

@@ -87,6 +87,24 @@ pub const KeyBindings = struct {
         try self.bindings.append(.{ .key = '?', .modifiers = SHIFT_MASK, .command = .search_backward });
         try self.bindings.append(.{ .key = 'n', .modifiers = 0, .command = .search_next });
         try self.bindings.append(.{ .key = 'N', .modifiers = SHIFT_MASK, .command = .search_prev });
+        
+        // Vim cursor motions
+        try self.bindings.append(.{ .key = 'w', .modifiers = 0, .command = .cursor_word_next });
+        try self.bindings.append(.{ .key = 'b', .modifiers = 0, .command = .cursor_word_back });
+        try self.bindings.append(.{ .key = 'e', .modifiers = 0, .command = .cursor_word_end });
+        try self.bindings.append(.{ .key = '0', .modifiers = 0, .command = .cursor_line_start });
+        try self.bindings.append(.{ .key = '$', .modifiers = SHIFT_MASK, .command = .cursor_line_end });
+        try self.bindings.append(.{ .key = ';', .modifiers = 0, .command = .cursor_repeat_find });
+        try self.bindings.append(.{ .key = ',', .modifiers = 0, .command = .cursor_repeat_find_back });
+        try self.bindings.append(.{ .key = 'f', .modifiers = 0, .command = .cursor_char_find });
+        try self.bindings.append(.{ .key = 'F', .modifiers = SHIFT_MASK, .command = .cursor_char_find_back });
+        try self.bindings.append(.{ .key = 't', .modifiers = 0, .command = .cursor_char_till });
+        try self.bindings.append(.{ .key = 'T', .modifiers = SHIFT_MASK, .command = .cursor_char_till_back });
+        
+        // Visual mode and hjkl navigation
+        try self.bindings.append(.{ .key = 'v', .modifiers = 0, .command = .enter_visual_mode });
+        try self.bindings.append(.{ .key = 'h', .modifiers = 0, .command = .cursor_left });
+        try self.bindings.append(.{ .key = 'l', .modifiers = 0, .command = .cursor_right });
     }
 
     pub fn getCommand(self: *const Self, key: u32, modifiers: u32) ?Command {

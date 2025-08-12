@@ -39,6 +39,8 @@ pub const PopplerBackend = struct {
                 .extract_toc = extractToc,
                 .get_text_layout = getTextLayout,
                 .get_text_for_area = getTextForArea,
+                .get_text_for_page = getTextForPage,
+                .get_character_rect = getCharacterRect,
                 .render_text_selection = renderTextSelection,
                 .create_highlight_annotation = createHighlightAnnotation,
                 .save_document = saveDocument,
@@ -636,6 +638,69 @@ pub const PopplerBackend = struct {
         }
 
         std.debug.print("Successfully saved PDF with annotations to: {s}\n", .{abs_path});
+    }
+
+    fn getTextForPage(ptr: *anyopaque, allocator: std.mem.Allocator, page: u32) PdfError![]u8 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (self.document == null) return PdfError.InvalidPdf;
+
+        const doc = self.document.?;
+        const page_obj = c.poppler_document_get_page(doc, @intCast(page));
+        if (page_obj == null) return PdfError.PageOutOfRange;
+        defer c.g_object_unref(page_obj);
+
+        const text_c = c.poppler_page_get_text(page_obj);
+        if (text_c == null) return allocator.dupe(u8, "");
+        defer c.g_free(text_c);
+
+        const text_len = std.mem.len(text_c);
+        return allocator.dupe(u8, text_c[0..text_len]);
+    }
+
+    fn getCharacterRect(ptr: *anyopaque, page: u32, char_index: u32) PdfError!backend_mod.TextRect {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (self.document == null) return PdfError.InvalidPdf;
+
+        const doc = self.document.?;
+        const page_obj = c.poppler_document_get_page(doc, @intCast(page));
+        if (page_obj == null) return PdfError.PageOutOfRange;
+        defer c.g_object_unref(page_obj);
+
+        // Get text layout to find character position
+        var layout = backend_mod.TextLayout{ .rectangles = &[_]backend_mod.TextRect{}, .text = &[_]u8{} };
+        getTextLayout(ptr, self.allocator, page, &layout) catch {
+            return backend_mod.TextRect{ .x1 = 0, .y1 = 0, .x2 = 0, .y2 = 0 };
+        };
+        defer layout.deinit(self.allocator);
+
+        if (char_index >= layout.text.len) {
+            return backend_mod.TextRect{ .x1 = 0, .y1 = 0, .x2 = 0, .y2 = 0 };
+        }
+
+        // Find the rectangle for this character index
+        var current_char: u32 = 0;
+        for (layout.rectangles, 0..) |rect, i| {
+            if (current_char >= char_index) {
+                return rect;
+            }
+            
+            // Approximate: each rectangle might contain multiple characters
+            // This is a simplified implementation
+            if (i < layout.text.len) {
+                current_char += 1;
+            }
+            
+            if (current_char > char_index) {
+                return rect;
+            }
+        }
+
+        // Fallback to first rectangle if available
+        if (layout.rectangles.len > 0) {
+            return layout.rectangles[0];
+        }
+
+        return backend_mod.TextRect{ .x1 = 0, .y1 = 0, .x2 = 0, .y2 = 0 };
     }
 
     fn deinit(ptr: *anyopaque) void {
