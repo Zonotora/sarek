@@ -199,7 +199,7 @@ pub const Viewer = struct {
             .allocator = allocator,
             .backend_impl = backend_impl,
             .backend = backend_interface,
-            .keybindings = keybindings.KeyBindings.init(allocator),
+            .keybindings = keybindings.KeyBindings.init(allocator), // TODO: Handle potential error from init
             .filename = filename_copy,
             .full_path = full_path_copy,
             .width = WINDOW_WIDTH,
@@ -265,6 +265,7 @@ pub const Viewer = struct {
     }
 
     pub fn run(self: *Self) !void {
+        // TODO: Decouple GTK from viewer
         // Initialize GTK
         _ = c.gtk_init(null, null);
 
@@ -1286,20 +1287,17 @@ pub const Viewer = struct {
         std.debug.print("Exited command mode\n", .{});
     }
 
-    fn handleCommandModeInput(self: *Self, keyval: u32, modifiers: u32) bool {
-        _ = modifiers; // suppress unused parameter warning
-
-        // TODO: Need to properly map keybindings to keycodes
-        switch (keyval) {
-            27 => { // Escape
+    fn handleCommandModeInput(self: *Self, keyName: keybindings.KeyName, value: u32) bool {
+        switch (keyName) {
+            .ESCAPE => { // Escape
                 self.exitCommandMode();
                 return true;
             },
-            65293 => { // Enter/Return
+            .ENTER => { // Enter/Return
                 self.executeCommandLine();
                 return true;
             },
-            65288 => { // Backspace
+            .BACKSPACE => { // Backspace
                 if (self.command_buffer.items.len > 0 and self.command_cursor > 0) {
                     _ = self.command_buffer.orderedRemove(self.command_cursor - 1);
                     self.command_cursor -= 1;
@@ -1307,14 +1305,14 @@ pub const Viewer = struct {
                 }
                 return true;
             },
-            65361 => { // Left arrow
+            .ARROW_LEFT => { // Left arrow
                 if (self.command_cursor > 0) {
                     self.command_cursor -= 1;
                     self.redraw();
                 }
                 return true;
             },
-            65363 => { // Right arrow
+            .ARROW_RIGHT => { // Right arrow
                 if (self.command_cursor < self.command_buffer.items.len) {
                     self.command_cursor += 1;
                     self.redraw();
@@ -1323,8 +1321,9 @@ pub const Viewer = struct {
             },
             else => {
                 // Handle printable characters
-                if (keyval >= 32 and keyval <= 126) { // ASCII printable range
-                    const char: u8 = @intCast(keyval);
+                // TODO: Refactor
+                if (value >= 32 and value <= 126) { // ASCII printable range
+                    const char: u8 = @intCast(value);
                     self.command_buffer.insert(self.command_cursor, char) catch return true;
                     self.command_cursor += 1;
                     self.redraw();
@@ -1570,31 +1569,29 @@ fn onKeyPress(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callc
     const viewer: *Viewer = @ptrCast(@alignCast(user_data));
     const gdk_event: *GdkEventKey = @ptrCast(@alignCast(event.?));
 
-    // Extract key information
-    const keyval = gdk_event.keyval;
-    const modifiers = gdk_event.state;
+    const keyName = keybindings.gdkKeyvalToKeyName(gdk_event.keyval);
+    const modifiers = keybindings.gdkModifiersToFlags(gdk_event.state);
 
-    // Debug output
-    std.debug.print("keyval={} modifiers={} hardware_keycode={} mode={}\n", .{ keyval, modifiers, gdk_event.hardware_keycode, viewer.command_mode });
+    std.debug.print("Keypress key={} modifiers={}\n", .{ keyName, modifiers });
 
     // Handle command mode input
     if (viewer.command_mode == .COMMAND) {
-        return if (viewer.handleCommandModeInput(keyval, modifiers)) 1 else 0;
+        return if (viewer.handleCommandModeInput(keyName, gdk_event.keyval)) 1 else 0;
     }
 
     // Handle colon key to enter command mode
-    if (keyval == ':') {
+    if (keyName == .COLON) {
         viewer.enterCommandMode();
         return 1;
     }
 
     // Look up command using the keybinding system
-    if (viewer.keybindings.getCommand(keyval, modifiers)) |command| {
+    if (viewer.keybindings.getCommand(keyName, modifiers)) |command| {
         std.debug.print("Executing command: {}\n", .{command});
         viewer.executeCommand(command);
         return 1; // Event handled
     } else {
-        std.debug.print("No command found for keyval={} modifiers={}\n", .{ keyval, modifiers });
+        std.debug.print("No command found for key={} modifiers={}\n", .{ keyName, modifiers });
         return 0; // Event not handled
     }
 }

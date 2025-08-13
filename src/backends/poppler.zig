@@ -298,6 +298,7 @@ pub const PopplerBackend = struct {
         const ctx: *c.cairo_t = @ptrCast(@alignCast(cairo_ctx));
 
         // Scale the context
+        // TODO: Decouple cairo?
         c.cairo_scale(ctx, scale, scale);
 
         // Convert our selection rectangle to Poppler format
