@@ -4,6 +4,7 @@ const poppler = @import("backends/poppler.zig");
 const keybindings = @import("input/keybindings.zig");
 const commands = @import("input/commands.zig");
 const Command = @import("input/commands.zig").Command;
+const gtk = @import("window/gtk.zig");
 
 const c = @cImport({
     @cInclude("gtk/gtk.h");
@@ -295,24 +296,28 @@ pub const Viewer = struct {
         c.gtk_container_add(@ptrCast(self.scrolled_window), self.drawing_area);
         c.gtk_container_add(@ptrCast(self.window), self.scrolled_window);
 
+        // Set up event handler
+        const event_handler = gtk.EventHandler.init(self);
+        gtk.setEventHandler(event_handler);
+
         // Connect signals
-        _ = c.g_signal_connect_data(self.window, "destroy", @ptrCast(&onDestroy), null, null, 0);
+        _ = c.g_signal_connect_data(self.window, "destroy", @ptrCast(&gtk.onDestroy), null, null, 0);
         _ = c.g_signal_connect_data(self.drawing_area, "draw", @ptrCast(&onDraw), self, null, 0);
-        _ = c.g_signal_connect_data(self.window, "configure-event", @ptrCast(&onWindowResize), self, null, 0);
+        _ = c.g_signal_connect_data(self.window, "configure-event", @ptrCast(&gtk.onWindowResize), self, null, 0);
 
         // Add scroll event handling to force redraw on mouse wheel scroll
         c.gtk_widget_add_events(self.drawing_area, c.GDK_SCROLL_MASK);
-        _ = c.g_signal_connect_data(self.drawing_area, "scroll-event", @ptrCast(&onScroll), self, null, 0);
+        _ = c.g_signal_connect_data(self.drawing_area, "scroll-event", @ptrCast(&gtk.onScroll), self, null, 0);
 
         // Add key event handling
         c.gtk_widget_add_events(self.window, c.GDK_KEY_PRESS_MASK);
-        _ = c.g_signal_connect_data(self.window, "key_press_event", @ptrCast(&onKeyPress), self, null, 0);
+        _ = c.g_signal_connect_data(self.window, "key_press_event", @ptrCast(&gtk.onKeyPress), self, null, 0);
 
         // Add mouse event handling for text selection
         c.gtk_widget_add_events(self.drawing_area, c.GDK_BUTTON_PRESS_MASK | c.GDK_BUTTON_RELEASE_MASK | c.GDK_POINTER_MOTION_MASK);
-        _ = c.g_signal_connect_data(self.drawing_area, "button-press-event", @ptrCast(&onButtonPress), self, null, 0);
-        _ = c.g_signal_connect_data(self.drawing_area, "button-release-event", @ptrCast(&onButtonRelease), self, null, 0);
-        _ = c.g_signal_connect_data(self.drawing_area, "motion-notify-event", @ptrCast(&onMotionNotify), self, null, 0);
+        _ = c.g_signal_connect_data(self.drawing_area, "button-press-event", @ptrCast(&gtk.onButtonPress), self, null, 0);
+        _ = c.g_signal_connect_data(self.drawing_area, "button-release-event", @ptrCast(&gtk.onButtonRelease), self, null, 0);
+        _ = c.g_signal_connect_data(self.drawing_area, "motion-notify-event", @ptrCast(&gtk.onMotionNotify), self, null, 0);
 
         // Make window focusable for key events
         c.gtk_widget_set_can_focus(self.window, 1);
@@ -1287,7 +1292,7 @@ pub const Viewer = struct {
         std.debug.print("Exited command mode\n", .{});
     }
 
-    fn handleCommandModeInput(self: *Self, keyName: keybindings.KeyName, value: u32) bool {
+    pub fn handleCommandModeInput(self: *Self, keyName: keybindings.KeyName, value: u32) bool {
         switch (keyName) {
             .ESCAPE => { // Escape
                 self.exitCommandMode();
@@ -1371,279 +1376,100 @@ pub const Viewer = struct {
         std.debug.print("Unknown command: '{s}'\n", .{command_name});
         self.exitCommandMode();
     }
-};
 
-const GdkEventButton = extern struct {
-    type: GdkEventType,
-    window: ?*anyopaque,
-    send_event: i8,
-    time: u32,
-    x: f64,
-    y: f64,
-    axes: ?*anyopaque,
-    state: u32,
-    button: u32,
-    device: ?*anyopaque,
-    x_root: f64,
-    y_root: f64,
-};
-
-fn onButtonPress(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
-    const viewer: *Viewer = @ptrCast(@alignCast(user_data));
-    const button_event: *GdkEventButton = @ptrCast(@alignCast(event.?));
-
-    // Handle left mouse button for text selection
-    if (button_event.button == 1) { // Left button
-        viewer.startTextSelection(button_event.x, button_event.y);
-        return 1; // Event handled
+    // Event handler methods for gtk.EventHandler interface
+    pub fn onButtonPress(self: *Self, event: *gtk.GdkEventButton) bool {
+        // Handle left mouse button for text selection
+        if (event.button == 1) { // Left button
+            self.startTextSelection(event.x, event.y);
+            return true; // Event handled
+        }
+        return false; // Event not handled
     }
 
-    return 0; // Event not handled
-}
-
-fn onButtonRelease(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
-    const viewer: *Viewer = @ptrCast(@alignCast(user_data));
-    const button_event: *GdkEventButton = @ptrCast(@alignCast(event.?));
-
-    // Handle left mouse button release
-    if (button_event.button == 1) { // Left button
-        viewer.finishTextSelection();
-        return 1; // Event handled
+    pub fn onButtonRelease(self: *Self, event: *gtk.GdkEventButton) bool {
+        // Handle left mouse button release
+        if (event.button == 1) { // Left button
+            self.finishTextSelection();
+            return true; // Event handled
+        }
+        return false; // Event not handled
     }
 
-    return 0; // Event not handled
-}
-
-fn onMotionNotify(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
-    const viewer: *Viewer = @ptrCast(@alignCast(user_data));
-    const motion_event: *GdkEventButton = @ptrCast(@alignCast(event.?)); // Reuse button struct as it has x,y
-
-    // Update text selection if we're currently selecting
-    viewer.updateTextSelection(motion_event.x, motion_event.y);
-
-    return 0; // Let other handlers process this event too
-}
-
-fn onDestroy(_: *c.GtkWidget, _: ?*anyopaque) callconv(.C) void {
-    c.gtk_main_quit();
-}
-
-const GdkEventConfigure = extern struct {
-    type: GdkEventType,
-    window: ?*anyopaque,
-    send_event: i8,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-};
-
-fn onWindowResize(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
-    const viewer: *Viewer = @ptrCast(@alignCast(user_data));
-    // _ = event;
-    const gdk_event: *GdkEventConfigure = @ptrCast(@alignCast(event.?));
-
-    // Debug output to see resize events
-    // std.debug.print("Window resized to {}x{}\n", .{ gdk_event.width, gdk_event.height });
-
-    viewer.width = @as(f64, @floatFromInt(gdk_event.width));
-    viewer.height = @as(f64, @floatFromInt(gdk_event.height));
-
-    viewer.updateDrawingAreaSize();
-    viewer.redraw();
-
-    return 0; // Let other handlers process this event too
-}
-
-pub const GdkEventType = enum(c_int) {
-    GDK_NOTHING = -1, // Special null event
-    GDK_DELETE = 0,
-    GDK_DESTROY = 1,
-    GDK_EXPOSE = 2,
-    GDK_MOTION_NOTIFY = 3,
-    GDK_BUTTON_PRESS = 4,
-    GDK_2BUTTON_PRESS = 5,
-    // GDK_DOUBLE_BUTTON_PRESS = 5, // Alias
-    GDK_3BUTTON_PRESS = 6,
-    // GDK_TRIPLE_BUTTON_PRESS = 6, // Alias
-    GDK_BUTTON_RELEASE = 7,
-    GDK_KEY_PRESS = 8,
-    GDK_KEY_RELEASE = 9,
-    GDK_ENTER_NOTIFY = 10,
-    GDK_LEAVE_NOTIFY = 11,
-    GDK_FOCUS_CHANGE = 12,
-    GDK_CONFIGURE = 13,
-    GDK_MAP = 14,
-    GDK_UNMAP = 15,
-    GDK_PROPERTY_NOTIFY = 16,
-    GDK_SELECTION_CLEAR = 17,
-    GDK_SELECTION_REQUEST = 18,
-    GDK_SELECTION_NOTIFY = 19,
-    GDK_PROXIMITY_IN = 20,
-    GDK_PROXIMITY_OUT = 21,
-    GDK_DRAG_ENTER = 22,
-    GDK_DRAG_LEAVE = 23,
-    GDK_DRAG_MOTION = 24,
-    GDK_DRAG_STATUS = 25,
-    GDK_DROP_START = 26,
-    GDK_DROP_FINISHED = 27,
-    GDK_CLIENT_EVENT = 28,
-    GDK_VISIBILITY_NOTIFY = 29,
-    // 30 skipped in GDK
-    GDK_SCROLL = 31,
-    GDK_WINDOW_STATE = 32,
-    GDK_SETTING = 33,
-    GDK_OWNER_CHANGE = 34,
-    GDK_GRAB_BROKEN = 35,
-    GDK_DAMAGE = 36,
-    GDK_TOUCH_BEGIN = 37,
-    GDK_TOUCH_UPDATE = 38,
-    GDK_TOUCH_END = 39,
-    GDK_TOUCH_CANCEL = 40,
-    GDK_TOUCHPAD_SWIPE = 41,
-    GDK_TOUCHPAD_PINCH = 42,
-    GDK_PAD_BUTTON_PRESS = 43,
-    GDK_PAD_BUTTON_RELEASE = 44,
-    GDK_PAD_RING = 45,
-    GDK_PAD_STRIP = 46,
-    GDK_PAD_GROUP_MODE = 47,
-    GDK_EVENT_LAST = 48,
-
-    pub fn name(self: GdkEventType) []const u8 {
-        return switch (self) {
-            inline else => @tagName(self),
-        };
-    }
-};
-
-const GdkModifierMask = enum(u32) {
-    SHIFT_MASK = 1,
-    LOCK_MASK = 2,
-    CONTROL_MASK = 4,
-    MOD1_MASK = 8,
-    MOD2_MASK = 16,
-    MOD3_MASK = 32,
-    MOD4_MASK = 64,
-    MOD5_MASK = 128,
-    BUTTON1_MASK = 256,
-    BUTTON2_MASK = 512,
-    BUTTON3_MASK = 1024,
-    BUTTON4_MASK = 2048,
-    BUTTON5_MASK = 4096,
-    MODIFIER_RESERVED_13_MASK = 8192,
-    MODIFIER_RESERVED_14_MASK = 16384,
-    MODIFIER_RESERVED_15_MASK = 32768,
-    MODIFIER_RESERVED_16_MASK = 65536,
-    MODIFIER_RESERVED_17_MASK = 131072,
-    MODIFIER_RESERVED_18_MASK = 262144,
-    MODIFIER_RESERVED_19_MASK = 524288,
-    MODIFIER_RESERVED_20_MASK = 1048576,
-    MODIFIER_RESERVED_21_MASK = 2097152,
-    MODIFIER_RESERVED_22_MASK = 4194304,
-    MODIFIER_RESERVED_23_MASK = 8388608,
-    MODIFIER_RESERVED_24_MASK = 16777216,
-    MODIFIER_RESERVED_25_MASK = 33554432,
-    SUPER_MASK = 67108864,
-    HYPER_MASK = 134217728,
-    META_MASK = 268435456,
-    MODIFIER_RESERVED_29_MASK = 536870912,
-    RELEASE_MASK = 1073741824,
-    MODIFIER_MASK = 1543512063,
-};
-
-const GdkEventKey = extern struct {
-    type: GdkEventType, // The event type (enum or int in Zig, according to the C definition)
-    window: *anyopaque, // Pointer field => pointer in Zig
-    send_event: i8, // gint8 => i8
-    time: u32, // guint32 => u32
-    state: u32, // GdkModifierType => u32 (modifier state, not a pointer!)
-    keyval: u32, // guint => u32, usually used for key codes in GDK
-    length: i32, // gint => i32
-    string: [*c]u8, // gchar* => C pointer to u8 (or i8 if you want signed chars)
-    hardware_keycode: u16, // guint16 => u16
-    group: u8, // guint8 => u8
-    is_modifier: bool, // guint is_modifier : 1 => u1 (single bit field)
-};
-
-fn onKeyPress(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
-    const viewer: *Viewer = @ptrCast(@alignCast(user_data));
-    const gdk_event: *GdkEventKey = @ptrCast(@alignCast(event.?));
-
-    const keyName = keybindings.gdkKeyvalToKeyName(gdk_event.keyval);
-    const modifiers = keybindings.gdkModifiersToFlags(gdk_event.state);
-
-    std.debug.print("Keypress key={} modifiers={}\n", .{ keyName, modifiers });
-
-    // Handle command mode input
-    if (viewer.command_mode == .COMMAND) {
-        return if (viewer.handleCommandModeInput(keyName, gdk_event.keyval)) 1 else 0;
+    pub fn onMotionNotify(self: *Self, event: *gtk.GdkEventButton) bool {
+        // Update text selection if we're currently selecting
+        self.updateTextSelection(event.x, event.y);
+        return false; // Let other handlers process this event too
     }
 
-    // Handle colon key to enter command mode
-    if (keyName == .COLON) {
-        viewer.enterCommandMode();
-        return 1;
-    }
+    pub fn onKeyPress(self: *Self, event: *gtk.GdkEventKey) bool {
+        const keyName = keybindings.gdkKeyvalToKeyName(event.keyval);
+        const modifiers = keybindings.gdkModifiersToFlags(event.state);
 
-    // Look up command using the keybinding system
-    if (viewer.keybindings.getCommand(keyName, modifiers)) |command| {
-        std.debug.print("Executing command: {}\n", .{command});
-        viewer.executeCommand(command);
-        return 1; // Event handled
-    } else {
-        std.debug.print("No command found for key={} modifiers={}\n", .{ keyName, modifiers });
-        return 0; // Event not handled
-    }
-}
+        std.debug.print("Keypress key={} modifiers={}\n", .{ keyName, modifiers });
 
-const GdkEventScroll = extern struct {
-    type: GdkEventType,
-    window: ?*anyopaque,
-    send_event: i8,
-    time: u32,
-    x: f64,
-    y: f64,
-    state: u32, // if the pointer can be null; else without '?'
-    direction: c.GdkScrollDirection,
-    device: ?*anyopaque,
-    x_root: f64,
-    y_root: f64,
-    delta_x: f64,
-    delta_y: f64,
-    is_stop: bool, // replaces guint is_stop : 1;
-};
+        // Handle command mode input
+        if (self.command_mode == .COMMAND) {
+            return self.handleCommandModeInput(keyName, event.keyval);
+        }
 
-fn onScroll(_: *c.GtkWidget, event: ?*anyopaque, user_data: ?*anyopaque) callconv(.C) c.gboolean {
-    const viewer: *Viewer = @ptrCast(@alignCast(user_data));
+        // Handle colon key to enter command mode
+        if (keyName == .COLON) {
+            self.enterCommandMode();
+            return true;
+        }
 
-    const gdk_event: *GdkEventScroll = @ptrCast(@alignCast(event.?));
-    const ctrl_pressed = (gdk_event.state & c.GDK_CONTROL_MASK) != 0;
-
-    if (ctrl_pressed) {
-        switch (gdk_event.direction) {
-            c.GDK_SCROLL_UP => viewer.executeCommand(.zoom_in),
-            c.GDK_SCROLL_DOWN => viewer.executeCommand(.zoom_out),
-            c.GDK_SCROLL_SMOOTH => {
-                if (gdk_event.delta_y >= 0) {
-                    viewer.executeCommand(.zoom_in);
-                } else {
-                    viewer.executeCommand(.zoom_out);
-                }
-            },
-            else => {},
+        // Look up command using the keybinding system
+        if (self.keybindings.getCommand(keyName, modifiers)) |command| {
+            std.debug.print("Executing command: {}\n", .{command});
+            self.executeCommand(command);
+            return true; // Event handled
+        } else {
+            std.debug.print("No command found for key={} modifiers={}\n", .{ keyName, modifiers });
+            return false; // Event not handled
         }
     }
 
-    // Update current_page based on the visible page range after scrolling
-    // We need to delay this slightly to let GTK update the scroll position first
-    _ = c.g_idle_add(@ptrCast(&updateCurrentPageFromScroll), user_data);
+    pub fn onScroll(self: *Self, event: *gtk.GdkEventScroll) bool {
+        const ctrl_pressed = (event.state & c.GDK_CONTROL_MASK) != 0;
 
-    // Force a complete redraw to ensure status bar is properly positioned
-    viewer.redraw();
+        if (ctrl_pressed) {
+            switch (event.direction) {
+                c.GDK_SCROLL_UP => self.executeCommand(.zoom_in),
+                c.GDK_SCROLL_DOWN => self.executeCommand(.zoom_out),
+                c.GDK_SCROLL_SMOOTH => {
+                    if (event.delta_y >= 0) {
+                        self.executeCommand(.zoom_in);
+                    } else {
+                        self.executeCommand(.zoom_out);
+                    }
+                },
+                else => {},
+            }
+        }
 
-    return 0; // Let GTK handle the actual scrolling
-}
+        // Update current_page based on the visible page range after scrolling
+        // We need to delay this slightly to let GTK update the scroll position first
+        _ = c.g_idle_add(@ptrCast(&updateCurrentPageFromScroll), self);
 
+        // Force a complete redraw to ensure status bar is properly positioned
+        self.redraw();
+
+        return false; // Let GTK handle the actual scrolling
+    }
+
+    pub fn onWindowResize(self: *Self, event: *gtk.GdkEventConfigure) bool {
+        self.width = @as(f64, @floatFromInt(event.width));
+        self.height = @as(f64, @floatFromInt(event.height));
+
+        self.updateDrawingAreaSize();
+        self.redraw();
+
+        return false; // Let other handlers process this event too
+    }
+};
+
+// Helper function for updateCurrentPageFromScroll
 fn updateCurrentPageFromScroll(user_data: ?*anyopaque) callconv(.C) c.gboolean {
     const viewer: *Viewer = @ptrCast(@alignCast(user_data));
 
