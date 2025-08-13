@@ -1,5 +1,5 @@
 const std = @import("std");
-const viewer = @import("viewer.zig");
+const viewer = @import("ui/viewer.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
