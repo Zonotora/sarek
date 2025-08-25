@@ -305,7 +305,7 @@ pub const KeyBindings = struct {
         try bindings.put(.{ .key = .c, .modifiers = ModifierFlags.NONE }, .clear_selection);
 
         // Layout controls
-        try bindings.put(.{ .key = .GREATER_THAN, .modifiers = ModifierFlags.NONE }, .increase_pages_per_row);
+        try bindings.put(.{ .key = .GREATER_THAN, .modifiers = ModifierFlags.SHIFT }, .increase_pages_per_row);
         try bindings.put(.{ .key = .LESS_THAN, .modifiers = ModifierFlags.NONE }, .decrease_pages_per_row);
         try bindings.put(.{ .key = .NUM_1, .modifiers = ModifierFlags.NONE }, .single_page_mode);
         try bindings.put(.{ .key = .NUM_2, .modifiers = ModifierFlags.NONE }, .double_page_mode);
